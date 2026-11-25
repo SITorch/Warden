@@ -1,0 +1,31 @@
+# cargo-deny policy for the WARDEN public Alpha source candidate.
+# This policy validates the locked Rust dependency graph only. Native runtime
+# libraries and future binary redistribution remain LEGAL_REVIEW_REQUIRED.
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "GPL-2.0-only",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,45 @@
+[package]
+name = "warden"
+version = "0.1.0"
+edition = "2021"
+description = "Host-level runtime security guardian (eBPF sensors + Rust agent)"
+license = "GPL-2.0"
+
+# One auditable Rust executable with a deliberately small direct dependency tree:
+# a privileged long-running security daemon should have the least code it can.
+# aya is a pure-Rust BPF loader (no libbcc/libbpf linkage). The default bridge is
+# cleartext HTTP over std::net; the optional Phase 8 mTLS transport binds directly
+# to the system OpenSSL 3 API through `extern "C"` in src/tls.rs, so there is no
+# Rust TLS crate and no Cargo.lock change, but the shipped binary DOES link the
+# host's runtime libssl.so/libcrypto.so and is NOT fully static. TLS is otherwise
+# terminated at the deployment edge (reverse proxy/tunnel), as elsewhere here.
+[dependencies]
+aya = "0.13"
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+signal-hook = "0.3"
+log = "0.4"
+env_logger = "0.11"
+
+[[bin]]
+name = "warden"
+path = "src/main.rs"
+
+# Test-only. Dev-dependencies are not linked into `--release`, so the shipped
+# binary's tree above is unchanged. `aya-obj` is the same parser aya itself uses
+# at load time (already in the lock file as aya's own dependency), which is what
+# lets `tests/ringbuf_drop_counter.rs` assert the W-02 map contract against the
+# very object the binary embeds — a comment claiming a counter cannot fail, that
+# test can.
+[dev-dependencies]
+aya-obj = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"    # a guardian that panics should die cleanly and let systemd restart it
+strip = true

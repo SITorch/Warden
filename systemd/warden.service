@@ -1,0 +1,181 @@
+[Unit]
+Description=Warden host-level runtime security guardian (eBPF)
+Documentation=file:/usr/local/share/doc/warden/README.md
+# Start early and stay up: Warden should be watching before the app workers it
+# guards come up, and should outlive their crashes.
+After=network-online.target
+Wants=network-online.target
+
+# Failure must be TERMINAL and LOUD, not merely persistent.
+#
+# The previous shape here was `StartLimitIntervalSec=0` — "never rate-limit,
+# always restart" — justified as the dead-man's-switch half of tamper-evidence.
+# That reasoning was falsified by a live outage: a host whose config failed
+# validation restart-looped for hours (13,649 restarts) and produced no alert,
+# because the only alert Warden ships — the heartbeat — lives inside the process
+# that never starts. Measured on the restart-looping shape: `systemctl is-active`
+# answers `activating` (exit code 3), and a restart in progress is not `failed`,
+# so every pull-based monitor that treats anything other than `failed` — or that
+# only pages on `failed` — sees a host with zero coverage as a host that is
+# coming up. Infinite restart is not a dead-man's switch; it is a dead-man's
+# switch with the bell unplugged.
+#
+# So the limiter is armed: after `StartLimitBurst` starts inside
+# `StartLimitIntervalSec` the unit enters `failed`, which is a state that (a)
+# stops burning CPU and kernel BPF churn on a start that cannot succeed, (b) is
+# queryable from off-box, and (c) fires `OnFailure=` below.
+#
+# What this costs, stated honestly: a determined attacker with CAP_KILL on this
+# box can loop-kill Warden until the limiter trips and pin it down until someone
+# runs `systemctl reset-failed`. Under the old shape the same attacker pinned it
+# down just as effectively — protection was already gone between each kill — the
+# difference is only whether anyone finds out. Being down and audible beats
+# being down and reported healthy; that trade is the whole point of this change.
+# StartLimit* are [Unit] directives (systemd logs "Unknown key … in section
+# [Service], ignoring" if placed under [Service]).
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+# The alert half. Measured: this fires on EVERY failed start attempt, not only on
+# the limiter trip — nine failing starts gave nine alerts. That is deliberate
+# (see the header of the unit below); the limiter is what bounds the count.
+OnFailure=warden-deadman@%n.service
+
+[Service]
+Type=simple
+# Fail before touching the kernel, and fail with the config file's own error.
+# `--check` reads only /etc/warden/warden.toml — no bpf(), no map, no attach —
+# so a contradictory policy is rejected in the pre-start step, where the failure
+# counts toward the limiter above and reaches `failed`, instead of as a crash
+# after BPF programs have been loaded and half the guard is live.
+ExecStartPre=/usr/local/sbin/warden --check --config /etc/warden/warden.toml
+ExecStart=/usr/local/sbin/warden --config /etc/warden/warden.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart while the start is *possible*: a crash or a takedown comes back in 2s,
+# and the restarts stop being silent the moment they stop being unbounded.
+Restart=always
+RestartSec=2
+
+# ── Least privilege ─────────────────────────────────────────────────────────
+# Warden needs to load BPF, read kernel memory for tracing, and (in enforce
+# mode) signal offenders — but not full root. Grant exactly those capabilities
+# ambiently and drop everything else.
+#   CAP_BPF        — load programs + create/read maps
+#   CAP_SYS_PTRACE — read /proc/<pid>/{exe,cgroup,cmdline} across users for
+#                    enrichment; also required to read some protected /proc data
+#   CAP_KILL       — deliver SIGKILL to an offender in enforce mode
+#   CAP_PERFMON    — the perf/BPF profiling class
+#   CAP_SYS_ADMIN  — NOT optional, and not for the reason its name suggests.
+#                    `perf_event_open(2)` for a tracepoint or kprobe is gated on
+#                    CAP_SYS_ADMIN whenever kernel.perf_event_paranoid > 1, and
+#                    CAP_PERFMON does NOT satisfy that gate. Measured on the lab
+#                    VM (Debian 13, 6.12.107-deb13, paranoid=3): with the four
+#                    caps above, the exec tracepoint fails with EACCES and the
+#                    daemon exits at attach #1 — zero sensors, zero BPF-LSM, zero
+#                    protection; add CAP_SYS_ADMIN and all 14 sensors plus the 6
+#                    enforcing programs attach. Mainline's default knob value is
+#                    2 and the deployment host reports 4, so `paranoid > 1` is
+#                    the normal case, not the hardened one. The alternative is
+#                    `kernel.perf_event_paranoid = 1` in a sysctl drop-in, which
+#                    is worse: it opens kernel tracing to every unprivileged
+#                    process on the host to spare one seccomp-confined daemon a
+#                    capability. `warden --doctor` prints this host's value
+#                    against the caps of the process running it.
+# What CAP_SYS_ADMIN does NOT buy here: the syscall filter below refuses mount,
+# umount, reboot, kexec_load, keyctl, ptrace-injection and io_uring with EPERM
+# regardless of the capability set (verified on this host — `reboot(2)` and
+# `swapon(2)` return EPERM inside the sandbox), so the filter, not the capability
+# set, is the effective ceiling.
+#
+# Deliberately NOT granted: CAP_DAC_READ_SEARCH. It is what the field workaround
+# on the deployment host also added, and it is genuinely needed to read files
+# that are not world-readable as a uid-0 process with a reduced set (a guarded
+# file at 0600, an application's 0700 binary — see the loader-authorization
+# findings). That read is a claim Warden should make explicitly, not inherit.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_SYS_ADMIN
+
+# On older kernels (< 5.8) without CAP_BPF/CAP_PERFMON, comment the two lines
+# above and uncomment the next one — BPF load then needs full CAP_SYS_ADMIN:
+# AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL
+
+# ── Hardening ───────────────────────────────────────────────────────────────
+# A guardian is a prime target; shrink its own attack surface.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Warden writes exactly one thing to disk: the bridge spool (W-05). A finding
+# Sentinel did not accept is buffered there and delivered on a later start, so it
+# is the difference between "the platform has this event" and "it never did".
+# `ProtectSystem=strict` makes everything else read-only, so the spool needs a
+# writable path — StateDirectory is that path, and systemd creates it owned by
+# the service. It must contain bridge.spool_path from /etc/warden/warden.toml,
+# whose default (/var/lib/warden/bridge_spool.jsonl) is written to sit under
+# exactly this directory.
+StateDirectory=warden
+# 0700 rather than systemd's 0755 default: the directory name alone hints at what
+# is inside, and the spool holds command lines, executable paths and pids.
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/warden
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# The spool carries command lines and pids; files it creates must never be
+# born world-readable, whatever mode the code passes to open().
+UMask=0077
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# ── Syscall surface ─────────────────────────────────────────────────────────
+# @system-service is the standard allowlist for a daemon (file, memory, signal,
+# timing, and IPC plumbing). The two additions are the ones the guardian
+# genuinely needs and that @system-service excludes:
+#   bpf             — load programs, create/read maps
+#   perf_event_open — attach tracepoints/kprobes
+# Everything else — module loading, mount, ptrace injection, kexec, keyctl,
+# io_uring — is refused with EPERM.
+#
+# EPERM rather than the default kill: a filtered call should be invisible to a
+# correct daemon, and SIGSYS-on-filter would let anyone able to provoke one
+# unexpected syscall silence the guardian. The denial is still visible because
+# a service that stops heartbeating is itself an alert.
+SystemCallFilter=@system-service bpf perf_event_open
+SystemCallErrorNumber=EPERM
+# Warden only talks to: the bridge/heartbeat over TCP, and journald over its
+# unix socket. No packet sockets (it must not open raw sockets on the host it
+# is watching), no netlink, no AF_VSOCK.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ProcSubset=pid is deliberately NOT set: it hides non-pid /proc entries, and
+# Warden reads /proc/sys/kernel/hostname to label every finding and heartbeat.
+# With ProcSubset=pid that read fails and the host silently becomes
+# "unknown-host" — an observability wrapper that looks applied and is not.
+RestrictNamespaces=true
+
+# ── Phase 9 resource envelope ───────────────────────────────────────────────
+# These are HARD CAPS, not targets: the guardian is expected to stay well below
+# them. They are duplicated in config/warden.toml [resources] and in
+# src/resources.rs; a change to one without the other is refused by `warden
+# --check`, because a config that claims a ceiling systemd does not enforce is
+# worse than no claim at all. A deliberately tighter drop-in must be reflected
+# in all three places before the service is restarted.
+MemoryMax=768M
+CPUQuota=200%
+TasksMax=128
+LimitNOFILE=4096
+IOWeight=20
+# BPF maps can be charged against memlock on older kernels (measured on the
+# 6.12 lab VM as well as the 7.0 deployment kernel), so this one limit stays
+# unlimited: a capped MEMLOCK is an outage on those kernels, not hardening.
+LimitMEMLOCK=infinity
+
+# Run as root by default (BPF load is simplest there); the capability set above
+# is still the effective privilege ceiling. To run as an unprivileged user with
+# just the ambient caps, set User=/Group= to a dedicated account.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,58 @@
+# WARDEN public repository — local build/runtime/test artifacts.
+# NOTE: .gitignore does not untrack files already committed; the public export
+# applies an explicit inclusion manifest in addition to these rules.
+
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Generated / captured secret or environment material
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+.env
+.env.*
+*.local.toml
+*.secrets.toml
+credentials.json
+
+# Python bytecode and caches (validation helpers)
+__pycache__/
+*.py[cod]
+
+# Local state, logs, spool, runtime socket/pid files
+*.log
+*.pid
+*.sock
+/run/
+/state/
+/spool/
+warden.spool*
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Snapshot archives and temporary investigation material
+*.zip
+*.tar.gz
+*.tgz
+/scratch/*_out.txt
+/scratch/*.tsv
+/scratch/__pycache__/
+
+# Temporary VM artifacts
+*.qcow2
+*.raw
+*.img
+
+# Secret-scan / raw local evidence output (sanitized summaries live in docs/)
+/evidence/prq/*_raw.txt
+/evidence/prq/*scan*.txt

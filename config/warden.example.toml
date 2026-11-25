@@ -1,0 +1,333 @@
+# warden.example.toml — SAFE PUBLIC STARTING CONFIGURATION for WARDEN.
+#
+# This file is DATA, never code. Warden reads it at startup and re-reads it on
+# SIGHUP. Copy it to /etc/warden/warden.toml and adjust for your host.
+#
+# DEFAULT POSTURE: observe-only. No kill responder, guarded-file denial, or
+# cgroup egress denial is armed. Findings go to the journal only; no SENTINEL
+# bridge or heartbeat endpoint is configured. This file passes
+#   warden --config-validate --strict --config warden.example.toml
+# without any edits.
+#
+# PERMISSIONS: install this file mode 0640, owned root:root (or the Warden
+# service account). It may contain future credentials and guarded-asset paths.
+# The in-repository config/warden.toml is a separate operational sample and is
+# historically mode 0664; always chmod 0640 the deployed copy.
+#
+# ENFORCEMENT is disabled by default in TWO independent places:
+#   [enforce] arm = false      -> file/inode LSM guards log would-denies only
+#   [egress]  enabled=false    -> optional cgroup egress hooks are not attached
+#   [respond] kill_* = false   -> no userspace kill responder is active
+# Leave all three off until you have observed clean findings on your workload.
+#
+# This is the `balanced` built-in profile emitted by `warden --profile balanced`.
+# It is intentionally generic: replace example process/cgroup names with your
+# own, and see README.md / docs/security/ for the security model and limits.
+# WARDEN IS EXPERIMENTAL ALPHA SOFTWARE — not a complete EDR or host firewall.
+#
+# Strict validation prints PASS_WITH_WARNINGS for this untouched example: the
+# app cgroup matchers are empty while app-only egress/listen judgement is on,
+# so CONNECT/LISTEN records are read then discarded. That is deliberate — the
+# example cannot know your application cgroup. Set [app] cgroup_contains to your
+# real cgroup, or set the app_only flags to false, to clear the warning. Quiet
+# logs are not clean logs: confirm sensors actually attached before trusting it.
+#
+# warden profile: balanced
+# cgroup volume counters left OFF: not all required capabilities are VERIFIED (perf_gate=UNAVAILABLE (perf_event_paranoid=4 and this process lacks CAP_SYS_ADMIN; the installed unit's capabilities must be checked separately))
+# no kill responder, guarded-file denial or cgroup egress denial is armed; opt in only after observing clean findings
+# SENTINEL bridge not configured: findings go to the journal only
+# capability summary: btf=VERIFIED, cgroup_v2=VERIFIED, bpffs=VERIFIED, bpf_lsm=VERIFIED, perf_gate=UNAVAILABLE, process_capabilities=VERIFIED, bpf_syscall=UNKNOWN, hook:tcp_sendmsg=VERIFIED, hook:tcp_cleanup_rbuf=VERIFIED, hook:udp_sendmsg=VERIFIED, hook:udp_recvmsg=VERIFIED, hook:udpv6_sendmsg=VERIFIED, hook:udpv6_recvmsg=VERIFIED
+# Save this output to warden.toml, then: warden --check --strict --config PATH
+schema_version = 1
+mode = "observe"
+
+[runtime]
+ring_size_kib = 256
+enrich_cache_ms = 100
+
+[resources]
+memory_max_mb = 768
+cpu_quota_percent = 200
+tasks_max = 128
+open_files_max = 4096
+io_weight = 20
+
+[protect]
+comms = [
+    "granian",
+    "celery",
+    "daphne",
+]
+cgroup_contains = []
+protect_self = true
+targets = []
+
+[app]
+cgroup_contains = []
+exe_allowlist = []
+
+[exec_rules]
+shell_comms = [
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "nc",
+    "ncat",
+    "socat",
+    "perl",
+    "ruby",
+]
+flag_deleted_exe = true
+untrusted_exe_prefixes = [
+    "/tmp",
+    "/var/tmp",
+    "/dev/shm",
+    "/run/user",
+]
+
+[network_rules]
+app_egress_only = true
+egress_allow = []
+allow_ports = []
+allow_loopback = true
+deny_destinations = []
+
+[c2_rules]
+enabled = true
+min_dials = 6
+window_secs = 900
+min_interval_secs = 10
+max_interval_secs = 600
+max_jitter = 0.5
+cooldown_secs = 900
+max_actors = 512
+max_history = 32
+max_destinations = 32
+
+[cred_rules]
+app_privesc_only = true
+expected_privilege_comms = [
+    "sudo",
+    "su",
+    "sshd",
+    "login",
+    "polkitd",
+    "pkexec",
+    "systemd",
+    "systemd-logind",
+]
+expected_privilege_exes = []
+flag_capability_gain = true
+
+[ptrace_rules]
+benign_reader_comms = [
+    "fuser",
+    "systemd-journal",
+    "systemd",
+    "runc",
+    "runc:[1:CHILD]",
+]
+benign_reader_exes = [
+    "/usr/bin/runc",
+    "/usr/bin/crun",
+]
+
+[module_rules]
+allow_modules = [
+    "nf_conntrack",
+    "nf_tables",
+    "nf_nat",
+    "nf_defrag_ipv4",
+    "nf_defrag_ipv6",
+    "nf_reject_ipv4",
+    "nfnetlink",
+    "nft_chain_nat",
+    "nft_compat",
+    "ip_tables",
+    "ip6_tables",
+    "iptable_filter",
+    "iptable_nat",
+    "x_tables",
+    "xt_tcpudp",
+    "xt_conntrack",
+    "xt_MASQUERADE",
+    "xt_CHECKSUM",
+    "xt_addrtype",
+    "xt_set",
+    "xt_mark",
+    "xt_connmark",
+    "xt_comment",
+    "ipt_REJECT",
+    "ip_set",
+    "bridge",
+    "stp",
+    "llc",
+    "br_netfilter",
+    "wireguard",
+    "libcurve25519",
+    "xfrm_user",
+    "xfrm_algo",
+    "overlay",
+    "veth",
+    "snd_hrtimer",
+    "snd_seq_dummy",
+]
+severity = "critical"
+
+[file_rules]
+app_files_only = true
+watch_names = []
+ransom_extensions = [
+    ".locked",
+    ".encrypted",
+    ".crypt",
+    ".crypto",
+    ".enc",
+    ".locky",
+    ".wncry",
+    ".wcry",
+    ".cerber",
+    ".zepto",
+    ".cryptolocker",
+    ".ryuk",
+    ".conti",
+    ".lockbit",
+]
+burst_threshold = 50
+burst_window_secs = 5
+
+[service_rules]
+persistence_dirs = [
+    "systemd/system",
+    "systemd/user",
+    "/cron",
+    "crontab",
+    "autostart",
+    "init.d",
+    "rc.local",
+    "ld.so.preload",
+    "ld.so.conf",
+    "profile.d",
+    "authorized_keys",
+    "sudoers.d",
+]
+allow_paths = []
+severity = "critical"
+
+[listen_rules]
+app_listen_only = true
+allow_ports = []
+allow_loopback = true
+
+[network_snapshot]
+enabled = true
+interval_secs = 300
+attribute = true
+report_max_sockets = 32
+attribute_max_pids = 4096
+
+[net_volume]
+enabled = false
+interval_secs = 60
+report_min_bytes = 65536
+max_rows_per_tick = 8
+cgroup_walk_max = 4096
+cgroup_root = "/sys/fs/cgroup"
+
+[bpf_rules]
+allow_loaders = ["warden"]
+allow_loader_exes = []
+severity = "critical"
+watch_prog_types = [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    14,
+    16,
+    17,
+    18,
+    24,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+]
+
+[mount_rules]
+bind_only = true
+watch_sources = [
+    "/dev",
+    "/proc",
+    "/sys",
+    "/etc",
+    "/root",
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/containerd",
+]
+allow_sources = []
+ignore_source_prefixes = [
+    "/oldroot",
+    "/newroot",
+    "/proc/self/fd",
+    "/run/systemd/namespace-",
+    "/run/systemd/unit-root",
+    "/run/user",
+    "/tmp/newroot",
+    "/tmp/.private",
+]
+allow_pseudo_device_binds = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/pts",
+    "/dev/ptmx",
+    "/dev/shm",
+    "/dev/mqueue",
+    "/dev/hugepages",
+]
+severity = "high"
+allow_actor_exes = [
+    "/usr/lib/snapd/snap-confine",
+    "/usr/libexec/snapd/snap-confine",
+]
+suppress_exempt_sources = [
+    "/dev/sd",
+    "/dev/nvme",
+    "/dev/vd",
+    "/dev/mapper",
+    "/dev/dm-",
+    "/dev/mem",
+    "/dev/kmem",
+    "/dev/port",
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/containerd",
+    "/run/containerd",
+]
+
+[enforce]
+arm = false
+guarded_files = []
+
+[egress]
+enabled = false
+arm = false
+deny = []
+
+[respond]
+kill_reverse_shell = false
+kill_takedown_attacker = false
+kill_privilege_escalation = false
+kill_ransomware = false
+require_anchored_identity = true

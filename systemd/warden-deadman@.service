@@ -1,0 +1,52 @@
+[Unit]
+# The alert half of warden.service's `OnFailure=`.
+#
+# Measured behaviour (Debian 13, systemd 257, throwaway unit with the same
+# `Restart=always`/`RestartSec=2`/limiter shape): `OnFailure=` fires on EVERY
+# failed start attempt, not only on the terminal trip of the start limiter. Nine
+# failing starts produced nine `warden-deadman` journal entries about three
+# seconds apart. That is the correct amount of noise for a host with no
+# protection — but it means this unit is not "the alarm at the end of the
+# outage"; it is the alarm for each refusal, and the `failed` state is announced
+# by the same last entry that says the unit is done trying. Do not "fix" this by
+# adding rate limiting here; the limiter on warden.service is what bounds it.
+#
+# Why this exists at all: Warden's only other alarm (the heartbeat in
+# src/heartbeat.rs) is a thread inside the daemon. A daemon that never started,
+# or that died before its first beat, cannot send one — so the two failures that
+# most need an alert are exactly the two the in-process dead-man is structurally
+# blind to. This unit lives outside the process, so it can report the process's
+# absence.
+Description=Warden dead-man alert: %i failed to start
+Documentation=file:/usr/local/share/doc/warden/README.md
+Documentation=file:/usr/local/share/doc/warden/README.md
+
+[Service]
+Type=oneshot
+# One shot, no retry. An alert unit that restarts is a second outage, and one
+# that depends on the unit it is reporting would never run at all.
+#
+# It writes to the journal only. No network, no BPF, no /proc reading, no
+# privilege — the failure it announces may have been caused by a broken binary,
+# so the announcer must not be able to inherit that breakage.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX
+# /dev/log only; nothing here needs to reach the rest of the filesystem.
+ProtectClock=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+UMask=0077
+# The alert itself, and the commands that answer it. `logger` is util-linux,
+# present on every host this package installs onto; it is not optional here,
+# because an alert gated behind a tool the operator may not have installed is the
+# same silent-failure class this unit was written to end.
+ExecStart=/usr/bin/logger -p daemon.crit -t warden-deadman \
+  "%i FAILED TO START: this host has NO Warden coverage now. If this message repeats, the start limiter has tripped (or is about to) and the unit will stay down until an operator intervenes. Diagnose with: systemctl status %i ; journalctl -u %i -n 100 ; /usr/local/sbin/warden --check --config /etc/warden/warden.toml. A common cause is a config that Config::validate refuses (see the first lines of journalctl -u %i) — fix the file, then: systemctl reset-failed %i && systemctl restart %i"

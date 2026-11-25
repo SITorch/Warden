@@ -1,0 +1,1020 @@
+# warden.toml — Warden host-guardian policy.
+#
+# This file is DATA, never code. The agent reads it at startup and re-reads it
+# on SIGHUP. Ship it to /etc/warden/warden.toml (see systemd/warden.service).
+#
+# The default posture below is OBSERVE-ONLY: Warden watches, judges, logs, and
+# (if a bridge is configured) reports to Sentinel — but never kills anything.
+# Flip to enforce + opt into individual responders only once you trust the
+# findings on your box.
+#
+# UNCOMMENTING IS A SECTION OPERATION, NOT A KEY OPERATION (W2K-23). A key belongs
+# to the most recent `[section]` header ABOVE it, not to the block of comments around
+# it. The live file proves why that matters: the deploy script appends its own
+# `[bridge]` table at the bottom, so this file's commented bridge keys sit under
+# `[respond]`, and uncommenting `spool_path` there silently leaves the spool where the
+# unit file expects it. Warden now prints every key it cannot read — at `--check`, at
+# startup, and on each reload — as `section.key` (with an index inside guard entries).
+# It warns rather than refuses: a sensor that will not start over a typo is a coverage
+# gap, not a safety win.
+
+# Configuration document schema. 1 is the version understood by this build;
+# omitting the key is accepted as legacy version 0 and can be migrated with
+# `warden --config-migrate --target-version 1`.
+schema_version = 1
+
+# "observe" = report only, never kill. "enforce" = allow the responders that
+# are individually enabled under [respond] to act. Start at observe.
+mode = "observe"
+
+# ── Sensor channel and per-event cost (W2K-13) ──────────────────────────────
+# Neither of these changes what is detected; both change what it costs. The
+# defaults are exactly what Warden shipped with before this section existed, so
+# deleting the section changes nothing.
+[runtime]
+# Capacity of the kernel→userspace event ring, in KiB. The ring is lossy by
+# contract: under a flood the kernel drops records rather than blocking a
+# syscall, and the W-02/W2K-14 counters report what was lost and by which sensor.
+# If that warning says the ring is too small, raise this and RESTART — the ring
+# is allocated when its map is created, so SIGHUP reports the intention and keeps
+# the running size until the process comes back up.
+#
+# Must be a power-of-two number of pages, because that is what the kernel
+# allocates: 200 would silently become 256, and Warden refuses such a config
+# instead of measuring drops against a capacity nobody asked for. Range
+# 64..16384 KiB.
+ring_size_kib = 256
+# Reuse a process's /proc evidence (exe, cmdline, cgroup) across events for this
+# many milliseconds. Without it every event costs four /proc reads; with it a
+# busy actor costs one (the start-time read, which is what proves the pid still
+# names the same process). execve-triggered events always re-read, because exec
+# is the one change the key cannot see.
+#
+# The window is the maximum lag an attribution can carry — a cgroup can move
+# under a live process — so it is deliberately short, 0 disables the cache, and
+# more than 5000 is refused. Takes effect on SIGHUP.
+enrich_cache_ms = 100
+# A key in this section that is spelled wrong is ignored, not refused: Warden
+# does not reject unknown keys anywhere in this file. After editing it, confirm
+# with `warden --check`, which prints both the requested ring and the ring this
+# host's page size would build.
+
+# ── Phase 9 production resource envelope ───────────────────────────────────
+# These five numbers are a DECLARATION of the hard caps in
+# systemd/warden.service, not knobs Warden applies at runtime. `warden --check`
+# prints them as policy and REFUSES a value that disagrees with the shipped unit;
+# `warden --doctor` reads the kernel's cgroup files for the process running that
+# command and says plainly that this is not a measurement of the daemon. Change
+# a cap only by editing the unit, this file and src/resources.rs together, then
+# restarting deliberately. Defaults below reproduce the shipped unit exactly.
+[resources]
+memory_max_mb = 768       # MemoryMax=768M
+cpu_quota_percent = 200   # CPUQuota=200% (two CPUs' worth of one CPU)
+tasks_max = 128           # TasksMax=128 (threads + processes)
+open_files_max = 4096     # LimitNOFILE=4096
+io_weight = 20            # IOWeight=20 (relative, 1..10000)
+# LimitMEMLOCK stays infinity in the unit: older kernels charge BPF maps against
+# memlock, so capping it is an outage rather than hardening.
+
+# ── What Warden guards ──────────────────────────────────────────────────────
+# A signal or ptrace aimed at any of these processes is a takedown attempt and
+# fires immediately. protect_self keeps Warden's own pid in the set so an
+# attacker can't quietly decapitate the guardian.
+#
+# W2K-36 / W2K-41 — what the finding says now. Every signal and ptrace against
+# a protected pid still ships as `endpoint:self_tamper`; what changed is that the
+# record now names the basis for its own verdict, in `detail.reason` (machine
+# readable) and `detail.authorization` (one sentence, what this host could
+# verify). The classes:
+#   unauthorized_signal   an outside actor sent a number that terminates or
+#                         freezes the target — Critical, the original rule.
+#   inert_signal          SIGCONT/SIGWINCH/SIGCHLD/SIGURG: the kernel would not
+#                         act on it, so it is control traffic at Info, not a blow.
+#   service_control       the sender's pid was 1, i.e. the service manager
+#                         stopping or reloading a unit — Low, and never armed.
+#   own_reload_path       SIGHUP at Warden's own pid, whose handler reloads the
+#                         config instead of stopping the sensor — Low.
+#   self_termination      the target aimed the signal at itself (a panic, an
+#                         abort(), `kill(getpid(), …)`) — Medium, never armed.
+#   ptrace_attach         a real attach/inject request — High, always.
+#   verified_external_reader / unverified_reader / in_app_reader /
+#   app_cgroup_unconfigured  the four answers a /proc READ gets, ranked by
+#                         whether the reader's identity could be shown to belong
+#                         to something outside the application (see the note in
+#                         [ptrace_rules] and [app] below).
+# A `comm` alone never earns a demotion in any of these classes: prctl(PR_SET_NAME)
+# is available to every process on the host. And none of it changes enforcement —
+# kill_takedown_attacker still fires only for SIGKILL/SIGTERM/SIGSTOP/SIGQUIT/
+# SIGABRT from an unauthorized actor (W2K-42 leaves that list as it found it).
+#
+# W-R4 — read this before choosing a selector. Membership does two things: the
+# kernel reports a signal/ptrace against the pid as a takedown attempt, AND the
+# responder refuses to kill the pid. That is only useful if the RIGHT process is
+# in the set:
+#   comms            exact 15-byte comm. Any process can take a protected
+#                    process's name with prctl(PR_SET_NAME), so a comm entry
+#                    alone is a name, not an identity.
+#   cgroup_contains  substring of the cgroup path. The loosest selector — it
+#                    can match unrelated processes and is not a security
+#                    boundary.
+#   [[protect.targets]]  every field it names must match (AND over
+#                    comm/exe/uid/cgroup). This is the strong option; prefer it
+#                    for anything that must not be impersonated. `uid` is the
+#                    REAL uid. A target that matches no live process is
+#                    reported in the journal — it protects nobody.
+#
+# Since W-R4, kill-immunity is also bound to the process's start time, so a
+# recycled pid does not inherit protection. The kernel tripwire map is still
+# keyed by pid alone (that is a kernel-side limitation, documented in DESIGN.md).
+[protect]
+comms = ["granian", "celery", "daphne"]   # match by exact process comm
+cgroup_contains = []                        # e.g. ["sentinel.service"] to match a unit
+protect_self = true
+
+# Identity target — uncomment and edit. Every named field must hold, so a
+# process that merely copies the comm does not match. `exe` is the real path
+# behind /proc/<pid>/exe; on a hidepid= host it is unreadable and this target
+# matches nothing (Warden warns at load rather than pretending to protect).
+# [[protect.targets]]
+# comm = "granian"
+# exe = "/usr/bin/granian"
+# uid = 999
+# cgroup = "/system.slice/granian.service"   # EXACT path, not a substring
+
+# ── What counts as "the application" ────────────────────────────────────────
+# Actor attribution for every app-scoped detector (exec, egress, privilege
+# change, listeners, file bursts). A shell spawned *inside* the app cgroup is a
+# reverse-shell incident; the same shell in an admin's login session is routine.
+# With this empty Warden cannot tell them apart, so those detectors stay silent
+# and only deleted-exe, protected-pid signal/ptrace, module/BPF, mount and
+# persistence-creation findings remain. Warden warns at startup when it is empty.
+#
+# W2K-41 also hangs one judgement on this key: a process that READS a protected
+# pid through /proc is demoted from Medium to Info only when its executable AND
+# its cgroup both resolved and it is provably NOT inside a cgroup named here.
+# With `cgroup_contains = []` no reader can be shown to be outside the
+# application, so every such read keeps its Medium tier and says
+# `app_cgroup_unconfigured` as the reason.
+[app]
+cgroup_contains = []                        # e.g. ["app.service", "docker-"]
+# The app's own binaries, matched on the resolved /proc/<pid>/exe (never comm).
+# Naming one vouches for that executable under the staging-location rule below;
+# it does not silence a shell-name match or a deleted-on-disk binary.
+exe_allowlist = []                          # e.g. ["/usr/local/bin/python3.11"]
+
+# ── exec-based detection (reverse shell / fileless) ─────────────────────────
+[exec_rules]
+# Matched against the exec's identity — the resolved /proc/<pid>/exe, the path
+# the execve tracepoint saw, and comm — because comm is 15 bytes the process
+# rewrites with prctl(PR_SET_NAME) whenever it likes.
+shell_comms = ["sh", "bash", "dash", "zsh", "nc", "ncat", "socat", "perl", "ruby"]
+flag_deleted_exe = true                     # a binary deleted-on-disk = fileless (T3)
+# Where the above names can't reach: `cp /bin/bash /tmp/svc-agent` exec'd by the
+# app is a finding because the binary came out of a directory any local user can
+# write into, whatever it is called. Medium severity and it never arms the
+# responder — an unexplained exec is not a proven shell. [] disables the rule;
+# every entry must be an absolute path deeper than /.
+untrusted_exe_prefixes = ["/tmp", "/var/tmp", "/dev/shm", "/run/user"]
+
+# ── egress-based detection (C2 / reverse-shell dial-out) ────────────────────
+# The kernel records every outbound connect from the app; this section decides
+# which are sanctioned. Each record carries the destination AND the socket's
+# transport (`tcp`/`udp`/`icmp`/`other`), which is what lets a dial to port 53 be
+# told apart as a resolver or a tunnel; the finding repeats it as `detail.protocol`,
+# or `null` when the record carried no claim. The default posture is the strictest
+# one that fits a request-serving worker: it should reach its datastores and nothing
+# else, so an EMPTY egress_allow means "flag any outbound connection", and you
+# permit the backing services by port below (or by address in egress_allow).
+[network_rules]
+app_egress_only = true       # only judge egress from the app cgroup (see [app]).
+                             # With no app cgroup named, nothing is judged: the
+                             # kernel still emits every connect, and userspace drops
+                             # each one before deciding it — `warden --check` says
+                             # `egress=OFF` rather than pretending otherwise.
+egress_allow = []            # sanctioned destinations: "10.0.0.5:443" or bare "10.0.0.5"
+allow_ports = []             # e.g. [5432, 6379] to permit Postgres/Redis anywhere
+allow_loopback = true        # 127.0.0.0/8 and ::1 are local IPC, never C2
+
+# ── local C2 cadence detection (src/c2.rs v2) ────────────────────────────────
+# Independent of the allowlist above: a dial that is sanctioned can still be
+# judged for beaconing. The detector uses the KERNEL ts_ns on each CONNECT ring
+# record; a zero or backwards stamp is discarded rather than counted. It needs
+# min_dials intervals to one destination in window_secs with a median interval
+# inside [min_interval_secs, max_interval_secs] and MAD-stable jitter, then
+# waits cooldown_secs before firing for that destination again. Confidence is
+# capped at 0.72 because there is no DNS/SNI/payload evidence here. No live
+# privileged validation of the kernel stamp path was performed in this pass.
+# The values below are the shipped defaults; uncomment to change them.
+# [c2_rules]
+# enabled = true
+# min_dials = 6
+# window_secs = 900
+# min_interval_secs = 10
+# max_interval_secs = 600
+# max_jitter = 0.5
+# cooldown_secs = 900
+# max_actors = 512
+# max_history = 32
+# max_destinations = 32
+
+# ── credential-based detection (privilege escalation) ───────────────────────
+# The kernel watches commit_creds — the one chokepoint every credential change
+# flows through — and only wakes userspace on a genuine RAISE (euid crossing to
+# root, or newly-effective capabilities), never on privilege being dropped. This
+# section decides which raises are incidents. A web worker turning into root is
+# the textbook post-exploitation step; an admin's `sudo` in a login shell is not.
+[cred_rules]
+app_privesc_only = true      # only judge raises from the app cgroup (see [app]);
+                             # with no app cgroup set, the sensor stays quiet
+                             # rather than flag every sudo on the box.
+# Comms whose whole job is to change credentials — the setuid plumbing of a
+# normal login. A raise attributed to one of these is suppressed even inside the
+# app cgroup; an exploit rarely routes its escalation through sudo first.
+# W2K-30: a comm is a string the process chose for itself with one
+# prctl(PR_SET_NAME) call, so since this stage a name here clears a raise only
+# when `/proc/<pid>/exe` is that name's binary (`sudo` running /usr/bin/sudo) or
+# could not be read at all. A raise by a process calling itself "sudo" from
+# /tmp/.cache/sudo-shim is a finding, not plumbing.
+expected_privilege_comms = ["sudo", "su", "sshd", "login", "polkitd", "pkexec", "systemd", "systemd-logind"]
+# The identity-based version of the list above: absolute executable paths whose
+# raise is expected plumbing, compared against /proc/<pid>/exe with a trailing
+# " (deleted)" stripped (so an upgrade that replaced the file under a running
+# program stays authorised). A path here authorises whatever name the process
+# carries, and it is the only entry that survives a forged comm.
+# Empty does not mean "nothing is plumbing" — the comm list still answers where
+# the name and the binary agree — it means nothing is authorised by identity, so
+# `--check` says so on every run. Pin the real files on a host that runs a
+# nonstandard helper, e.g. a setuid binary under /opt.
+expected_privilege_exes = []
+flag_capability_gain = true  # also flag a pure capability gain (e.g. CAP_SYS_ADMIN),
+                             # not only an outright uid→root transition.
+
+# ── ptrace-of-protected-pid detection (inspect / inject) ────────────────────
+# The kernel LSM hook security_ptrace_access_check fires for TWO classes, told
+# apart by the mode bits: PTRACE_MODE_ATTACH (0x02) is a real attach / inject /
+# cross-process memory read (PTRACE_ATTACH, process_vm_readv/writev,
+# /proc/<pid>/mem) — the T7/T8 threat, ALWAYS reported High. PTRACE_MODE_READ
+# (0x01) is a /proc metadata read (/proc/<pid>/maps, environ, fd); the daemons
+# below do this constantly to attribute files and supervise pids, so a READ by
+# one of them is silenced. A READ by ANY OTHER actor still surfaces at Medium —
+# an unknown process reading the protected signer's /proc/<pid>/environ or maps
+# is credential recon. An ATTACH is never silenced by this list.
+[ptrace_rules]
+# NOTE: "systemd-journald" is truncated to 15 chars by the kernel (TASK_COMM_LEN)
+# → "systemd-journal". fuser walks /proc/*/fd+maps; systemd is pid-1 supervision.
+# "runc" / "runc:[1:CHILD]" are Docker's runtime joining a container's namespaces
+# on exec; it usually exits before its exe can be resolved, so the path
+# allowlist below is not enough on its own.
+# W2K-30: since this stage a name here silences a READ only when the executable
+# Warden read is that name's binary (systemd ← /usr/lib/systemd/systemd, including
+# the kernel's own truncation and a "runc:[1:CHILD]" re-title) or when no exe could
+# be read at all. A process that renames itself "systemd" and reads a protected
+# pid's /proc/<pid>/environ from /tmp/.cache/systemd-scan is credential recon and
+# now reports as such.
+benign_reader_comms = ["fuser", "systemd-journal", "systemd", "runc", "runc:[1:CHILD]"]
+# Container runtimes join a target's namespaces through /proc/<pid>/ns/*, so every
+# `docker exec` — including the HEALTHCHECK Docker runs in the app container —
+# looks like a READ of the protected pid. Matched by resolved executable path,
+# not comm (a comm is one prctl(PR_SET_NAME) away from impersonating runc).
+# READ only; an ATTACH from a runtime still fires High.
+benign_reader_exes = ["/usr/bin/runc", "/usr/bin/crun"]
+
+# W2K-41 — the tier a READ gets when NO list above matches it. Nothing here
+# silences anything; the record always ships, and only how loudly it is called
+# changes. A read is demoted to Info only on four facts the reader did not choose:
+#   1. its /proc/<pid>/exe resolved,               (a name is not an identity)
+#   2. its /proc/<pid>/cgroup resolved,            (so 3 and 4 can be checked)
+#   3. [app] cgroup_contains is configured,        (otherwise nothing can be
+#                                                    shown to be outside the app)
+#   4. it is NOT inside that application cgroup.   (the app poking a neighbour is
+#                                                    an incident, not a monitor)
+# Fail any one and the read stays Medium with the failing fact named in
+# `detail.reason` — `unverified_reader`, `app_cgroup_unconfigured` or
+# `in_app_reader`. Passing all four gives `verified_external_reader`.
+# An ATTACH never enters this ladder: it is High on the mode bit alone, whatever
+# the reader's identity shows, and is never worded as routine observation.
+
+# ── module-load detection (rootkit / LKM implant) ───────────────────────────
+# The kernel wakes userspace on every kernel-module load, whichever path brought
+# it in. A loaded module runs in ring 0 with total authority — the classic
+# rootkit vector. allow_modules is honoured ONLY for an UNTAINTED module (in-tree
+# AND signed): an out-of-tree/unsigned .ko that merely borrows an allowlisted
+# name still fires, so the list is safe to pre-populate with the host boot set
+# without opening a name-spoof hole. The default below is the standard Linux
+# networking/firewall/container boot set that modprobe loads in the first seconds
+# of boot (the FP storm this quiets). For a truly locked-down host that loads
+# nothing at runtime, set allow_modules = [] for the strictest posture. This
+# sensor never kills: by the time a module is loaded it is already in-kernel.
+[module_rules]
+# Standard boot module set (netfilter/nftables/bridge/wireguard/xfrm/sound). All
+# in-tree+signed, so the taint gate still convicts a spoofed-name tainted .ko.
+allow_modules = [
+    "nf_conntrack", "nf_tables", "nf_nat", "nf_defrag_ipv4", "nf_defrag_ipv6",
+    "nf_reject_ipv4", "nfnetlink", "nft_chain_nat", "nft_compat",
+    "ip_tables", "ip6_tables", "iptable_filter", "iptable_nat",
+    "x_tables", "xt_tcpudp", "xt_conntrack", "xt_MASQUERADE", "xt_CHECKSUM",
+    "xt_addrtype", "xt_set", "xt_mark", "xt_connmark", "xt_comment",
+    "ipt_REJECT", "ip_set",
+    "bridge", "stp", "llc", "br_netfilter",
+    "wireguard", "libcurve25519", "xfrm_user", "xfrm_algo",
+    "overlay", "veth", "snd_hrtimer", "snd_seq_dummy",
+]
+severity = "critical"        # ceiling for a non-allowlisted (or tainted-allowlisted) load;
+                             # drop to "high" on a host where late loads are unusual.
+
+# ── file rename/unlink detection (ransomware / tamper) ──────────────────────
+# The kernel records destructive file ops at the two LSM chokepoints ransomware
+# cannot avoid (rename over the victim, unlink the original). This section holds
+# three rules: a watched-name hit fires for ANY actor (targeted tamper of the
+# crown jewels); a rename into a known ransom extension is a high-confidence
+# single-event conviction; and a per-actor modification BURST is the behavioural
+# net that catches encryptor families whose extension isn't listed. The extension
+# and burst rules are app-attributed (a package manager churns files too); the
+# watched-name rule is not.
+[file_rules]
+app_files_only = true        # extension/burst rules judge only app-cgroup actors;
+                             # with no app cgroup set, those two stay quiet.
+                             # watch_names still fires for anyone.
+watch_names = []             # leaf-name substrings always worth a finding, e.g.
+                             # ["shadow", ".env", "id_rsa", "audit.log"]
+# Rename-into markers that betray an encryptor. Matched case-insensitively as a
+# suffix of the new name. Extend with families you see in the wild.
+ransom_extensions = [".locked", ".encrypted", ".crypt", ".crypto", ".enc", ".locky",
+                     ".wncry", ".wcry", ".cerber", ".zepto", ".cryptolocker",
+                     ".ryuk", ".conti", ".lockbit"]
+burst_threshold = 50         # destructive ops by one actor within the window that
+                             # trip the mass-modification rule; 0 disables it.
+burst_window_secs = 5        # the sliding window the burst is counted over.
+
+# ── persistence-create detection (boot/login-survival footholds) ────────────
+# Every durable foothold — a rogue systemd unit, a cron entry, an XDG autostart
+# .desktop, an init.d script, an ld.so.preload, an extra authorized_keys — is a
+# FILE that appears in a well-known persistence directory. The kernel records
+# every file create at the security_inode_create LSM chokepoint and captures the
+# path (the created leaf plus three ancestor directories); this section decides
+# which of those paths matter. The model mirrors module_rules: an allowLIST of
+# sanctioned paths over a WATCHLIST of persistence directories. Unlike egress
+# this is NOT app-attributed — a foothold in /etc/systemd/system is an incident
+# whoever writes it — and it never kills (the artifact is already on disk;
+# removal is an operator's off-box decision).
+#
+# persistence_dirs: path substrings that mark a directory as a persistence
+# location, matched case-insensitively against the rebuilt path. The defaults
+# cover the standard Linux vectors; a single entry like "systemd/system" catches
+# /etc, /usr/lib, and /run copies at once. An EMPTY list disables the verdict
+# (every create is then allowlisted).
+#
+# allow_paths: paths (or substrings) whose creation under a persistence dir is
+# expected — the units your OWN provisioning lays down. Checked before the dir
+# list, so one sanctioned unit needn't force you to stop watching its directory.
+# Empty by default: the strictest posture is that no runtime persistence write is
+# expected at all. Add your own here (e.g. "/etc/systemd/system/warden.service").
+[service_rules]
+persistence_dirs = ["systemd/system", "systemd/user", "/cron", "crontab",
+                    "autostart", "init.d", "rc.local", "ld.so.preload",
+                    "ld.so.conf", "profile.d", "authorized_keys", "sudoers.d"]
+allow_paths = ["/var/spool/anacron/"]  # anacron's own run stamps: its files are
+                             # named cron.daily/hourly/… but they are TIMESTAMP
+                             # records, not cron jobs. Other sanctioned paths,
+                             # e.g. ["/etc/systemd/system/warden.service"], go here.
+severity = "critical"        # ceiling for a non-allowlisted persistence write; drop
+                             # to "high" on a host where late unit writes are unusual.
+
+# ── listen-socket detection (bind shell / inbound backdoor) ─────────────────
+# The dual of egress. Instead of the app dialing OUT to a C2, something on the
+# box opened a port and is waiting for the attacker to dial IN — a bind shell, a
+# planted sshd on an odd port, a webshell helper. The kernel wakes userspace when
+# a socket enters LISTEN and records the local bound endpoint; this section
+# decides which listeners are sanctioned, mirroring [network_rules]. The default
+# posture fits a request worker: it should open its known service ports and
+# nothing else, so an EMPTY allow_ports means "flag any new listener", loopback
+# binds are ignored (unreachable off-box), and detection is app-attributed.
+[listen_rules]
+app_listen_only = true       # only judge listeners opened by the app cgroup (see
+                             # [app]). With no app cgroup named, nothing is judged —
+                             # the records still arrive and are dropped — rather than
+                             # flagging sshd/systemd sockets.
+allow_ports = []             # the app's own service ports, e.g. [8000, 8443]
+allow_loopback = true        # a 127.0.0.0/8 or ::1 listener is local-only, never
+                             # an inbound backdoor. Off only to hunt localhost pivots.
+
+# ── socket snapshot (the PULL half of network visibility) ───────────────────
+# Every sensor above is a transition: CONNECT fires on a dial, LISTEN on a bind,
+# the verdict pair on a completed connect. None of them can tell you what was
+# already true before Warden attached. A listener that predates the daemon, a
+# connection opened while the 256 KiB ring was full, a socket whose sensor is
+# muted — each is invisible for the whole life of the process, and the journal
+# cannot tell "nothing is listening" from "nothing listened while I was watching".
+#
+# /proc/net/{tcp,tcp6,udp,udp6} is state, not transitions, and answers the second
+# question. It costs no new capability (the unit needs nothing extra to read a
+# world-readable file), attaches no program, and enforces nothing — which is why
+# it can ship while the egress POLICY questions are still open.
+#
+# OFF BY DEFAULT, and that is a cost decision, not caution: the walk runs inside
+# the same single-threaded loop that drains the ring. Enable it on a host where
+# you actually want a periodic socket inventory — a VPS with a couple of listeners
+# is trivial; a busy relay with thousands of established sockets is not.
+[network_snapshot]
+enabled = false              # the reconciler takes its first snapshot at startup
+                             # and then every interval_secs.
+interval_secs = 300          # floor is 5s, and the floor exists because a cadence
+                             # that never sleeps starves the ring drain. 300s is a
+                             # deliberate "inventory, not firehose" default.
+attribute = true             # resolve each reported socket's inode back to its
+                             # process by walking /proc/<pid>/fd. Without this the
+                             # snapshot is netstat; with it, Warden can say WHICH
+                             # process holds a socket no sensor ever reported.
+report_max_sockets = 32      # how many listeners one tick may name. Only the
+                             # sockets that will be reported are walked, so this
+                             # bounds the expensive half too.
+attribute_max_pids = 4096    # cap on the /proc/<pid>/fd scans per tick. Hitting it
+                             # is reported as "walk stopped at its budget", never as
+                             # "this socket has no owner".
+
+# What it does NOT give you, stated here so nobody discovers it in an incident:
+#   • journal only. No finding, no bridge label, no /ndr/ row — the platform's
+#     batch contract is an open decision, and a coverage statement does not get to
+#     make it by accident.
+#   • Warden's own network namespace. Each of the six production containers has
+#     its own netns, so their sockets are NOT in this table (the same structural
+#     blind spot that made the host's MIB counters undercount the dial rate).
+#   • completeness between ticks. It samples: a socket that opens and closes
+#     inside one interval is in no snapshot. Push still owns "what happened".
+
+# ── per-cgroup network volume counters (N-05, roadmap stage 16b) ────────────
+# The third shape of network visibility, and the only one that answers "HOW MUCH".
+# The push sensors see a transition; the snapshot above sees which sockets exist
+# right now; neither can total bytes, because a 344-byte record carrying ~12 bytes
+# of network fact on a 256 KiB LOSSY ring (≈760 records in flight) loses exactly
+# the records that would have summed to the answer, exactly when the load makes the
+# question matter.
+#
+# So the counting happens in the kernel. Six fexit programs — on tcp_sendmsg,
+# tcp_cleanup_rbuf, udp_sendmsg, udp_recvmsg, udpv6_sendmsg and udpv6_recvmsg —
+# add to one 40-byte entry per cgroup and never touch the ring; userspace reads
+# the totals once per interval. Cost is a hash lookup and a few atomic adds per
+# syscall, not a trip into userspace per byte. A separate per-hook counter slot
+# advances on EVERY completed fexit invocation before the emit gate and the
+# map-full check, so "the probe ran but no total landed" is distinguishable from
+# "no call happened"; ops_out/ops_in still count only calls that were charged.
+#
+# OFF by default, unlike the sensors' emit gates. These programs sit on the send
+# and receive path of EVERY socket on the host; whether a lightweight VPS pays
+# that for totals nobody has asked to read yet is an operator's decision. When off
+# the agent says so on its coverage line instead of leaving the absence to be read
+# as a quiet network.
+[net_volume]
+enabled = false              # the in-kernel gate on the bump path. SIGHUP REWRITES it
+                             # (W2K-31): the gate is one slot of runtime_cfg, so this
+                             # value follows a reload exactly like the tick settings
+                             # below do, and the journal says which way the kernel went
+                             # and re-states the coverage line for the new posture.
+                             # What still needs a restart is the ATTACH SET — all six
+                             # programs are attempted at load either way. Before asking
+                             # aya to load them Warden reads the target kernel's BTF and
+                             # compares all six fexit prototypes; a kernel whose
+                             # prototype no longer matches is skipped with an explicit
+                             # reason in the startup/doctor lines instead of a generic
+                             # attach error. With this false the six return immediately
+                             # at the bump gate; their invocation counters still advance.
+interval_secs = 60           # floor 5s. The totals are cumulative, so a faster tick
+                             # shortens the sample window without revealing anything.
+                             # Below 10s this is also what the agent CANNOT deliver:
+                             # the tick rides the 10s protect-refresh loop, so 5 means
+                             # 10 in practice — measured live, and stated on the
+                             # coverage line rather than hidden here.
+report_min_bytes = 65536     # a cgroup must move at least this much SINCE THE LAST
+                             # TICK to earn a line. Measured against movement, not
+                             # lifetime, so a busy tenant is reported for being busy
+                             # now rather than for having once transferred a lot.
+max_rows_per_tick = 8        # how many cgroups one line may name. When more moved
+                             # than this, the line says "N of M named" — a bounded
+                             # report is never presented as a complete one.
+cgroup_walk_max = 4096       # cap on the /sys/fs/cgroup walk that turns an id into
+                             # a path. Past it, totals still count; they just print
+                             # as an unnamed id, which is not the same as a zero.
+cgroup_root = "/sys/fs/cgroup"
+
+# What these totals are NOT, stated here because a byte counter invites the wrong
+# reading:
+#   • NOT wire bytes. Payload measured at the send/recv call, and the difference
+#     runs both ways: kernel IP/TCP headers and retransmitted segments are
+#     OUTSIDE these totals (so the wire carries more than they say), while a
+#     userspace TLS library's own record framing is INSIDE them (so they are more
+#     than the plaintext). Compare either number to an interface counter and both
+#     will look wrong — that is what measuring at the syscall boundary means.
+#   • NOT packets. One tcp_sendmsg can produce zero segments or hundreds; the
+#     second field is therefore OPERATIONS (calls that returned), not packets.
+#     Ops high with bytes flat is its own tell — a process hammering a closed
+#     socket. Counting "packets" here would have invented a metric the kernel
+#     never reported.
+#   • NOT per-flow or per-process. Nothing in this hook set sees a close, so a
+#     flow-keyed or pid-keyed counter would hand a dead tenant's total to whoever
+#     reused the identity next. The cgroup id is monotone and never recycled, so
+#     the failure mode here is only ever a stale total that admits it is stale.
+#   • ADDRESS FAMILY. Stage ۱۶f added `fexit/udp_recvmsg` because §22 MEASURED the
+#     datagram asymmetry (137 KiB received, `bytes_in` still zero), and §23 measured the
+#     fix: `out 102400B/100 ops, in 95232B/93 ops` for a known IPv4 datagram test. §23
+#     also found that an IPv6 datagram dispatched through `udpv6_sendmsg`/`udpv6_recvmsg`
+#     was invisible in both directions; this build ships both v6 hooks, and M15 closed
+#     that gap on an isolated 6.12.107 kernel: BTF preflight matched all six prototypes,
+#     the verifier accepted and attached all six programs, and a known `[::1]` transfer
+#     moved `udp6_out`/`udp6_in` +4/+4 with 2800B in each direction (IPv4-mapped traffic
+#     on the same socket path moved +3/+3). This is IPv6-SOCKET-PATH accounting, not a
+#     claim about pure IPv6 wire traffic: the hook sees which recv/send function ran,
+#     not `skb->protocol`. TCP covers both families because the stream hooks do not care
+#     about family. On a host where a prototype is BTF-incompatible or an attach fails,
+#     the startup/coverage line names the skipped direction; read it before a total.
+#   • A PEEK counts, and §23 sized it: one 1024-byte datagram peeked then read printed
+#     `in 2048B/2 ops`. `recvmsg(MSG_PEEK)` copies bytes to userspace without consuming
+#     them, and both ingress hooks count that copy — `tcp_cleanup_rbuf` has no flags
+#     argument to filter on, so the two agree by meaning the same thing. A reader that
+#     peeks then reads inflates `bytes_in`.
+#   • MSG_TRUNC is capped, not charged at `ulen`. Linux v6.12 may return the original
+#     datagram length when the caller's buffer is too small; charging that would claim
+#     more bytes were copied than the buffer held. Every receive hook therefore charges
+#     `ret > 0 ? min(ret, len) : 0`. M15 measured a 1000-byte datagram into a 64-byte
+#     buffer as `1000B out / 64B in` with one op each, not `1000B in`.
+#   • NOT excluding loopback. A proxy or sidecar's localhost traffic is in these
+#     totals; skc_bound_dev_if says what a socket is bound to, not what it routes,
+#     so filtering on it would have claimed a certainty the field does not carry.
+#   • bounded at 512 cgroups. Past that, new cgroups are refused and every refusal
+#     is counted and reported — the map is a bound, not a census.
+
+# ── bpf-program-load detection (eBPF rootkit / stealth-hook implant) ────────
+# eBPF is itself an implant vector: a loaded program can hide processes and tamper
+# with syscall returns in-kernel WITHOUT a module (so module_rules never sees it).
+# The kernel wakes userspace on bpf(BPF_PROG_LOAD) — program loads only, never the
+# far hotter map operations — and Warden loads its OWN programs before this probe
+# attaches, so it never trips itself. Report-only: the program is already in-kernel
+# by the time we see it, so removal is an operator's off-box decision.
+#
+# Two gates, in order: first the PROGRAM TYPE (what the program can DO), then the
+# LOADER'S IDENTITY — since W2K-18 that is its /proc/<pid>/exe, and the comm list
+# only decides a load whose executable could not be read. The type gate is what stops
+# the systemd storm — pid 1 continuously loads cgroup_skb / cgroup_device /
+# socket_filter programs (network & device
+# policy for every unit it starts), which cannot hook syscalls or hide a rootkit.
+# watch_prog_types lists the IMPLANT-CAPABLE bpf_prog_type numbers (from
+# enum bpf_prog_type): kprobe(2), sched_cls(3), sched_act(4), tracepoint(5),
+# xdp(6), perf_event(7), sk_skb(14), sk_msg(16), raw_tracepoint(17),
+# cgroup_sock_addr(18), raw_tracepoint_writable(24), tracing(26), struct_ops(27),
+# ext(28), lsm(29), sk_lookup(30), syscall(31), netfilter(32) — the types an eBPF
+# rootkit / stealth hook / network-plane implant needs. The tracing/hook family
+# AND the network-plane types (tc 3/4, sockmap 14/16, sock_addr 18 transparent-C2
+# redirect, sk_lookup 30 inbound backdoor, netfilter 32) are all watched. The
+# high-volume BENIGN systemd/runtime loads (socket_filter 1, cgroup_skb 8,
+# cgroup_sock 9, cgroup_device 15) are deliberately ABSENT, so a service start is
+# silent while a real implant still convicts. A load whose type is NOT in this
+# list is silent whoever loads it. Type 0 (unreadable) fails toward surfacing. An
+# EMPTY list disables the type gate (every load reaches the loader allowlist).
+[bpf_rules]
+watch_prog_types = [2, 3, 4, 5, 6, 7, 14, 16, 17, 18, 24, 26, 27, 28, 29, 30, 31, 32]  # implant-capable types
+allow_loaders = ["warden"]   # comms that decide ONLY a load whose executable could
+                             # not be read AND whose loader the kernel says is gone
+                             # (pidfd_open answered ESRCH — W2K-29; a loader still
+                             # running at that pid is a finding whatever its name,
+                             # because hiding behind an unreadable exe is the attack
+                             # shape, not the accident shape). NOT authorization:
+                             # comm is 15 bytes any process rewrites with one
+                             # prctl(PR_SET_NAME) call. Keep it tight and do NOT add
+                             # "systemd" here to quiet boot loads — quiet those by
+                             # type (already done) instead.
+# W2K-18: what actually authorizes an implant-capable load. Each entry is matched
+# against the loader's resolved /proc/<pid>/exe (a " (deleted)" suffix is stripped
+# first, so a binary upgraded under a running loader still matches itself). Empty is
+# the strictest posture and the shipped default: NO loader on the host is authorized
+# by identity, so every implant-capable load with a readable executable is a finding
+# and only the already-exited loader falls back to the comm list above. `--check`
+# names that state on every run. Pin the sanctioned loaders to stop the findings:
+#   allow_loader_exes = ["/usr/local/sbin/warden", "/usr/sbin/bpftool"]
+# Relative paths, blanks, and "/" are refused at load — they can never equal an exe
+# target, so they would read as an armed rule while authorizing nothing.
+#
+# Stage 13 (closing W2K-29's residual): this same list is now also matched WITHOUT a
+# path. The hook stamps the loader's executable file — (dev, ino) of mm->exe_file —
+# into the record itself, at the moment of the load, so a load whose
+# /proc/<pid>/exe could not be read is no longer a load with no identity at all.
+# That was the NORMAL case, not the odd one: a short-lived loader exits before
+# userspace enriches the record (measured live: the exe was readable for only 6 of 15
+# such loads, and those 6 were decided by the path anyway). The stamped pair is
+# compared against the inodes these paths resolve to, and there are three answers:
+#   the kernel-named file IS one of them   -> silent, by identity, loader long gone.
+#   a path resolved and none is that file  -> a finding that QUOTES the numbers
+#       (detail.loader_exe_dev / loader_exe_ino, and the pair in the summary), and an
+#       allowlisted comm no longer gets to clear it. To find what ran:
+#       find / -xdev -inum <loader_exe_ino>
+#   nothing configured, or no entry can be stat()ed -> NO BASIS, not a deny: the
+#       weaker comm posture above is exactly what it was before this stage.
+# So an empty list keeps the shipped behaviour unchanged, and pinning paths now buys
+# two things: authorization for the readable-exe loads, and a real comparison for the
+# loads where /proc had nothing to say. A readable path still decides FIRST — paths
+# are what this list holds and what an operator can audit; the pair is consulted only
+# when the path is gone.
+allow_loader_exes = []
+severity = "critical"        # ceiling for a non-allowlisted load; drop to "high" on
+                             # a host where ad-hoc tracing is common.
+
+# ── mount detection (container escape / host-fs exposure) ───────────────────
+# A mount is how a contained attacker breaks containment: bind-mounting the host
+# root or a host device tree into a new location, or exposing the docker socket.
+# The kernel wakes userspace at security_sb_mount and records the mount source
+# (device / bind path); this section is an allowlist over watched sources,
+# mirroring module/service rules. Like persistence this is NOT app-attributed — a
+# bind mount of the host root is an incident whoever performs it — and it never
+# kills (the mount has already taken effect; unmounting is an operator's call).
+#
+# watch_sources: host paths worth policing, matched case-insensitively at a PATH
+# COMPONENT BOUNDARY (not a raw substring) in either direction — the source is
+# flagged when it IS a watched dir, sits UNDER one, or is an ancestor that EXPOSES
+# one. The defaults catch the classic escape tells (host device/config trees, the
+# container runtime sockets). An EMPTY list disables the verdict.
+# ignore_source_prefixes: sandbox / namespace-construction roots rejected up front,
+# before watch_sources. A desktop sandbox (bwrap, flatpak, the polkit agent)
+# assembles its mount namespace by bind-mounting many paths under a private staging
+# root — /oldroot/dev/null, /proc/self/fd/7, /run/user/… — whose sources contain
+# "/dev" or "/proc" as a substring but are sandbox internals, not a host escape.
+# This is what stops the polkit-agent / bwrap false-positive storm; matched at a
+# component boundary so a genuine "/proc" host bind is not swallowed. W2K-05: an
+# actor INSIDE the app cgroup does not get this exemption — mount(2) resolves
+# /proc/self/fd/N through the caller's fd table, so the source is resolved via
+# that actor's /proc and the real target is judged (unresolvable fd/root/cwd
+# indirections fire as `mount_source_unresolved`).
+# allow_pseudo_device_binds: the discriminator neither source-prefix nor
+# destination matching can give. A hardened systemd unit (PrivateDevices=,
+# ProtectSystem=) builds its private /dev by bind-mounting the REAL host pseudo-
+# devices — /dev/null, /dev/zero, /dev/pts, /dev/shm, … — each to the SAME target
+# path inside its new namespace (/dev/null -> /dev/null). The source is a genuine
+# child of the watched "/dev" tree AND the destination is identical, so nothing
+# about the path tells it apart from an escape — every hardened unit start fired
+# the /dev bind storm. The SET of sources is the tell: this is a fixed, well-known
+# list of harmless nodes, and binding one grants no host access. Matched by EXACT
+# path (case-insensitive), NOT a prefix — so an escape binding the whole "/dev"
+# tree, a raw disk ("/dev/sda", "/dev/mem"), or the device mapper (none of which
+# EQUALS a listed leaf) still fires. Empty list re-arms every /dev bind.
+# allow_sources: sources your own provisioning/orchestrator legitimately mounts,
+# checked after the watch match. Empty by default.
+[mount_rules]
+bind_only = true             # only judge BIND mounts (MS_BIND) — the escape shape;
+                             # a plain mount of a block device is routine admin work.
+                             # Off to police every mount of a watched source.
+watch_sources = ["/dev", "/proc", "/sys", "/etc", "/root",
+                 "/var/run/docker.sock", "/run/docker.sock", "/var/run/containerd"]
+ignore_source_prefixes = ["/oldroot", "/newroot", "/proc/self/fd",
+                          "/run/systemd/namespace-", "/run/systemd/unit-root",
+                          "/run/user", "/tmp/newroot", "/tmp/.private"]
+allow_pseudo_device_binds = ["/dev/null", "/dev/zero", "/dev/full",
+                             "/dev/random", "/dev/urandom", "/dev/tty",
+                             "/dev/pts", "/dev/ptmx", "/dev/shm",
+                             "/dev/mqueue", "/dev/hugepages"]
+allow_sources = []           # sanctioned mount sources, e.g. ["/etc/warden"]
+severity = "high"            # ceiling for a watched, non-allowlisted mount; raise to
+                             # "critical" on a host where NO runtime mounts are expected.
+# allow_actor_exes: host confinement machinery (snap-confine, systemd per-unit
+# sandboxing) bind-mounts whole host trees (/dev,/etc,/proc,/sys,/root) to BUILD a
+# sandbox — byte-identical in SOURCE to an escape, so only the ACTOR separates
+# them. Keyed on the resolved /proc/<pid>/exe, NEVER the comm (which any process
+# sets via prctl — a comm allowlist would let a contained attacker name itself
+# "snap-confine" and bind host / silently). Suppression also requires the actor to
+# be OUTSIDE the app cgroup and the exe to be non-deleted. systemd per-unit sandbox
+# binds (comm = the unit) are left for operators to add after watching the shadow
+# stream. Empty disables it.
+#
+# Live additions (2026-11-18, after a real observe window): Debian 13's hardened
+# units go through /usr/lib/systemd/systemd-executor, which bind-mounts `/` into
+# each unit's private namespace (comm shows as "(imesyncd)", "(geoclue)",
+# "(fwupd)", ...). dockerd binds /proc/<pid>/ns/net when attaching a container;
+# runc binds /proc/bus; the Vault forwarder (socat1) is itself a hardened unit.
+# All four are host confinement/runtime machinery, outside the app cgroup, and
+# `suppress_exempt_sources` still makes a raw disk or docker.sock bind fire even
+# from these exes. Keyed on the resolved exe, never on the spoofable comm.
+allow_actor_exes = [
+    "/usr/lib/snapd/snap-confine", "/usr/libexec/snapd/snap-confine",
+    "/usr/lib/systemd/systemd", "/usr/lib/systemd/systemd-executor",
+    "/usr/bin/dockerd", "/usr/bin/containerd", "/usr/bin/runc",
+    "/usr/bin/socat1",
+]
+# suppress_exempt_sources: never-benign bind sources that fire EVEN from an
+# allow_actor_exes actor — raw disks, kernel memory, device-mapper, and the
+# container-runtime sockets. A confinement builder never binds these; an escape
+# does. This is the carve-out so the exe allowlist can never short-circuit a
+# raw-disk or docker.sock escape. Matched as a leading prefix of the source.
+suppress_exempt_sources = ["/dev/sd", "/dev/nvme", "/dev/vd", "/dev/mapper",
+                           "/dev/dm-", "/dev/mem", "/dev/kmem", "/dev/port",
+                           "/var/run/docker.sock", "/run/docker.sock",
+                           "/var/run/containerd", "/run/containerd"]
+
+# ── ENFORCING guard (the one layer that can DENY, not just observe) ──────────
+# Everything above OBSERVES: it watches a chokepoint and emits a finding. This
+# section is different in kind — it is the one place Warden can PREVENT an
+# operation in-kernel, returning -EPERM before the read/write/rename/unlink/chmod
+# ever touches the file. That is the answer to "even if an attacker is already on
+# the box as root, can a file be made untouchable to them?": yes, here, because
+# the decision is made by a BPF-LSM program in the kernel against the file's
+# resolved (device, inode) — an identity that survives renames, hardlinks, bind
+# mounts and `..`, and that is NOT subject to the actor's uid (root included) when
+# root isn't the authorized owner.
+#
+# ── TWO HARD PREREQUISITES, both the operator's to satisfy ───────────────────
+#   1. KERNEL: the "bpf" LSM must be active. Check with
+#        cat /sys/kernel/security/lsm
+#      If "bpf" is absent, add it to the boot LSM list and REBOOT, e.g. append
+#        lsm=landlock,lockdown,yama,integrity,apparmor,bpf
+#      to GRUB_CMDLINE_LINUX in /etc/default/grub, run `update-grub`, reboot.
+#      Without this, the 5 enforcing programs cannot attach: Warden logs the
+#      failure ONCE and runs detection-only — every other sensor still works,
+#      but nothing here denies. (CONFIG_BPF_LSM=y is also required; it is on
+#      this kernel.)
+#   2. ARMING is deliberate and OFF by default (`arm = false`). Shadow-first is
+#      the whole safety model: with arm=false the guard still runs and still
+#      emits an `endpoint:access_denied` finding for every unauthorised touch —
+#      but it ALLOWS the operation through (a "would-deny"). You watch that
+#      shadow stream until you are certain the policy denies only what you mean
+#      it to, THEN flip arm=true. Arming a wrong policy is self-inflicted denial
+#      of your own service, so it is never automatic.
+#
+# The kernel side fails CLOSED to shadow: an unset/zero arm gate never denies.
+# Only an explicit arm=true returns -EPERM.
+[enforce]
+arm = false                  # false = SHADOW (log would-deny, allow through) — the
+                             # default and the safe first posture. true = ARMED
+                             # (return -EPERM, actually deny). Flip only after the
+                             # shadow findings look exactly right.
+
+# Each guarded file is resolved (stat'd) to its (device, inode) on startup, on
+# SIGHUP, and on every refresh tick — so a file rewritten in place (new inode) is
+# re-pinned to its current inode within ~10s, and protection never silently
+# follows a stale, unlinked inode. A path that doesn't resolve (missing,
+# permission, dangling symlink) is SKIPPED with a warning, never guessed.
+#
+# path            the file to guard. Resolved to (dev, ino); the path itself is
+#                 not what the kernel matches on (that would be bypassable) — it is
+#                 only how we LOOK UP the inode to protect.
+# authorized_uid  the ONE uid allowed the denied intents — the app's own service
+#                 account (e.g. the user the wallet-signing process runs as). Every
+#                 OTHER uid performing a denied intent is the incident. root is NOT
+#                 special unless allow_root = true.
+# deny            which intents are forbidden to an unauthorised actor, any of
+#                 "read"/"r", "write"/"w", "exec"/"x". Defaults to ["read","write"]
+#                 if omitted. A key file denies read+write; an append-only audit
+#                 log might deny only "write". An empty/unknown list guards nothing
+#                 (it will emit records but never deny — a warning says so).
+# allow_root      false (default) = even uid 0 is denied the intents — the strict
+#                 posture that stops a root intruder reading a wallet key. true =
+#                 uid 0 is also permitted, for files the app legitimately touches
+#                 as root. Leave false for secrets no root process should read.
+#
+# Examples (commented out — uncomment and set real uids/paths for your host):
+# [[enforce.guarded_files]]
+# path = "/etc/warden/wallet-signing.key"
+# authorized_uid = 991          # the signing service's own uid; nobody else, not root
+# deny = ["read", "write"]
+# allow_root = false
+#
+# [[enforce.guarded_files]]
+# path = "/var/lib/warden/audit.log"
+# authorized_uid = 991          # the auditor writes; everyone else is read-only-denied
+# deny = ["write"]              # append-only: unauthorised WRITE blocked, read allowed
+# allow_root = false
+#
+# ── MONEY-PATH + SELF-PROTECTION GUARDS (the Vault crown jewels) ─────────────
+# These are the files whose compromise is DIRECT financial loss or loss of the
+# guardian itself. They are shipped COMMENTED because every one needs the host's
+# REAL uid (system-assigned for `vault`, 10001 for the container appuser) — a
+# wrong authorized_uid under arm=true is self-inflicted downtime. The deploy
+# helper `deploy/warden/wire-guards.sh` resolves those uids and writes this block
+# into the live /etc/warden/warden.toml for you; or uncomment + set uids by hand.
+# Semantics reminder: authorized_uid is the ONE uid allowed the denied intents;
+# allow_root=false means uid 0 is ALSO denied (that is the whole point — a stolen
+# root shell must not read the SecretID). Because authorized_uid=0 *permits*
+# root, writing 0 with allow_root=false is a contradiction the loader now
+# REFUSES (the daemon will not start). To deny every writer including root,
+# name a uid that cannot write the file (nobody, 65534) with allow_root=false;
+# to let root write, set both authorized_uid=0 and allow_root=true. Guards are
+# SHADOW until arm=true above, so uncommenting them first only produces
+# `endpoint:access_denied` findings you watch — nothing is blocked until you
+# arm. Paths assume VAULT_DIR=/opt/vault.
+#
+# -- the unwrapped raw AppRole SecretID (whoever holds it can mint transit signs)
+# [[enforce.guarded_files]]
+# path = "/var/lib/wallet-vault/secret_id"
+# authorized_uid = 10001        # the container appuser (uid 10001, Dockerfile-fixed)
+# deny = ["read", "write"]
+# allow_root = false
+#
+# -- Vault's TLS private key (impersonate the listener / terminate the bridge)
+# [[enforce.guarded_files]]
+# path = "/opt/vault/tls/tls.key"
+# authorized_uid = 997          # `id -u vault`; NOT 0 (0 would permit root)
+# deny = ["read", "write"]
+# allow_root = false
+#
+# -- the combined CA bundle the containers trust: rewriting it MITMs the Vault
+#    bridge even with verify_tls=true (the trust anchor itself is swapped)
+# [[enforce.guarded_files]]
+# path = "/opt/vault/tls/app-ca-bundle.crt"
+# authorized_uid = 65534        # nobody: deny-all, root included. Regenerating
+# deny = ["write"]              # the bundle requires stopping warden first.
+# allow_root = false
+#
+# -- Vault server config (weaken the listener, disable audit, point storage away)
+# [[enforce.guarded_files]]
+# path = "/opt/vault/config/vault.hcl"
+# authorized_uid = 997          # `id -u vault`
+# deny = ["write"]
+# allow_root = false
+#
+# -- the on-disk Shamir shares + root token, IF still present. The right fix is to
+#    MOVE THIS OFF-BOX AND DELETE IT (deploy says so); guard it meanwhile.
+# [[enforce.guarded_files]]
+# path = "/opt/vault/UNSEAL-KEYS-KEEP-OFFLINE.txt"
+# authorized_uid = 997          # `id -u vault`
+# deny = ["read", "write"]
+# allow_root = false
+#
+# -- Warden's OWN tamper surface: binary, unit, config. deny=["write"] (reading a
+#    binary is fine; OVERWRITING it to run a no-op guardian is the attack).
+#    authorized_uid=65534 (nobody) with allow_root=false is a deny-all: root
+#    cannot rewrite them either. A legitimate `make install` upgrade is done by
+#    first `systemctl stop warden` (releasing the guard), installing, then
+#    starting.
+# [[enforce.guarded_files]]
+# path = "/usr/local/sbin/warden"
+# authorized_uid = 65534
+# deny = ["write"]
+# allow_root = false
+#
+# [[enforce.guarded_files]]
+# path = "/etc/warden/warden.toml"
+# authorized_uid = 65534
+# deny = ["write"]              # stops root emptying the guard set / flipping arm by file-edit
+# allow_root = false
+#
+# [[enforce.guarded_files]]
+# path = "/etc/systemd/system/warden.service"
+# authorized_uid = 65534
+# deny = ["write"]
+# allow_root = false
+
+# ── Responders (only consulted in enforce mode) ─────────────────────────────
+# All default OFF. Each is the riskiest thing for its class (a false positive is
+# self-inflicted downtime); enable only after observing clean findings.
+[respond]
+kill_reverse_shell = false
+kill_takedown_attacker = false
+kill_privilege_escalation = false   # kills a process that is now root — bar is high
+kill_ransomware = false             # kills a process mid-burst — highest benefit once trusted
+# W2K-25 — the one switch below is about PROOF, not permission. The kill toggles
+# above say whether a class may be killed; this says whether Warden may signal a
+# process it cannot anchor to the event that named it. That happens in one narrow
+# case: /proc was unreadable when the finding was built (no start time recorded)
+# and is readable only by the time enforcement runs. Delivering SIGKILL there hits
+# a process Warden cannot name — measured live in section 70 of the report, which
+# is why the default is true: withhold, log `ENFORCEMENT WITHHELD`, and leave the
+# target running. Set false only where an occasional wrong kill costs less than
+# letting a attacker run for the length of one event. It changes nothing while
+# mode = "observe", and nothing in the `/proc`-hidden case (that is already
+# refused as `unverifiable`).
+require_anchored_identity = true
+
+# ── Sentinel bridge (optional) ──────────────────────────────────────────────
+# Ships every finding to the platform's host-ingest endpoint. Cleartext HTTP is
+# the DEFAULT — point it at the internal address; TLS terminates at the edge
+# (reverse proxy / tunnel), as elsewhere in this deployment. Phase 8 adds an
+# optional direct mutual-TLS transport (below); it is off unless all three
+# credential paths are configured, and it changes no default. Omit the whole
+# section to keep findings local-log-only.
+#
+# READ ONCE AT STARTUP (W-R7): this section is NOT re-read on SIGHUP. Uncommenting
+# it, or repointing `url`, does nothing to a running Warden — the delivery thread
+# and its spool were built at boot and cannot be swapped mid-flight. `systemctl
+# reload warden` logs a warning naming the changed fields and repeats it on every
+# reload until you `systemctl restart warden`. After a restart, confirm delivery:
+# the startup line names the sections it picked up ("warden starting: …,
+# bridge=true, …"), and a bridge Sentinel is refusing to accept announces itself
+# as "bridge: Sentinel has not accepted N finding(s) …". A healthy uplink logs
+# nothing at the default level, so silence plus that startup line is the good case.
+# [bridge]
+# url = "http://127.0.0.1:8000/api/v1/sentinel/host/"
+# api_key = "REPLACE_WITH_SENTINEL_CLIENT_API_KEY"   # service must be "sentinel"
+# host = "prod-web-01"                                 # asset id stamped on findings
+# timeout_ms = 15000       # ONE budget for the whole attempt: resolve+connect+write+read.
+#                          # Keep it above the receiver's p100: a budget shorter than a
+#                          # batch that will commit anyway makes every retry overlap the
+#                          # attempt it is retrying (measured: 64 findings = 3.4 s).
+#
+# Delivery is durable (W-05): a finding Sentinel does not accept is retried with
+# backoff, buffered on disk, and delivered on a later start. These five keys bound
+# that, and the defaults are what the shipped systemd unit expects.
+# queue_max = 1024                        # findings held in memory before the spool
+# spool_path = "/var/lib/warden/bridge_spool.jsonl"   # needs StateDirectory=warden
+# spool_max_bytes = 67108864              # 64 MiB. REACHING THIS LOSES FINDINGS, loudly.
+# backoff_ms = 1000                       # first retry delay after a transient failure
+# max_backoff_ms = 300000                 # ceiling; a multi-hour outage is ~12 tries/hour
+#
+# Raising spool_max_bytes is the lever for a long outage (bursts, air-gapped
+# collectors). The spool is mode 0600 and holds command lines and paths, so it
+# belongs on an encrypted volume if the host's root is not one.
+#
+# TRANSPORT — two supported shapes, neither enabled by default beyond cleartext:
+#   1. Cleartext HTTP to a trusted local edge (the shipped default). TLS
+#      terminates at the proxy/tunnel, and `api_key` travels in a request header
+#      across the Warden→edge hop. That hop must therefore be loopback, a
+#      private/management network, or an encrypted tunnel. If it would cross an
+#      untrusted network, run a TLS-terminating proxy on this host and point
+#      `url` at that proxy's local http:// listener. No default TLS interception
+#      is performed.
+#   2. Direct mutual TLS (Phase 8): set url to https:// AND all three paths
+#      below. Warden then verifies the server certificate against the supplied
+#      CA and hostname, presents the agent certificate, and refuses to start on
+#      a partial set, a non-https URL, an unreadable file, or a private key that
+#      is group/world readable. The key path is named in logs; key BYTES never
+#      enter a string, envelope, spool, health report or this file.
+#
+# tls_ca_file = "/etc/warden/tls/ca.pem"           # trust anchor for the server
+# tls_cert_file = "/etc/warden/tls/agent.pem"      # per-agent client certificate
+# tls_key_file = "/etc/warden/tls/agent.key"       # mode 0600, no key bytes in config
+# tls_sni = "sentinel.internal"                    # optional; defaults to URL host
+#
+# That trusted-path sentence used to be only a sentence. W2K-19 made it a rule the config has to
+# satisfy: `warden --check` and startup classify the HOST OF `url` by the address it
+# really is and REFUSE a cleartext `http://` to a publicly routable literal IP:
+#
+# allow_public_plaintext = false     # (default) refuse http://<public-IP> at load
+#
+# Loopback, RFC1918, link-local, and CGNAT 100.64.0.0/10 (a shared VPC is not a
+# tunnel, so the private line says so out loud) load and print how they were
+# classified.
+#
+# A host NAME used to be the hole in that rule (W2K-28): `http://sentinel.example.com`
+# is not an IP literal, so nothing classified it, and the same key and the same
+# finding bodies would have gone to a public address because the URL was spelled with
+# letters. Now Warden resolves each configured uplink NAME ONCE at startup, with a
+# 2-second deadline, and applies the same refusal to the answer:
+#
+#   warden: bridge uplink host sentinel.example.com resolved to 1.1.1.1 (PUBLICLY ROUTABLE)
+#
+# If the name does not answer — a dead resolver, an NXDOMAIN, a deadline — Warden
+# still starts and says it could not classify the path. That is deliberate: refusing
+# to boot because DNS is down would turn an outage into an unmonitored host, and the
+# posture is then printed rather than hidden.
+#
+# The startup answer is an advisory, not the guarantee. Records move, a name can have
+# both a private and a public record, and Warden re-resolves after a connect failure,
+# so the delivery path classifies the address it is ACTUALLY about to send to and
+# refuses the send (the finding stays queued, then spooled) if that address is public
+# and unattested. `--check` cannot show you that second gate; the journal can, as
+# "… resolves to 203.0.113.9, a PUBLICLY ROUTABLE address … not sending".
+#
+# The beat gets the startup refusal but deliberately not the delivery refusal: a
+# heartbeat that stops because the collector's address changed is read off-box as
+# "this host went quiet", which is the false alarm the switch exists to avoid.
+#
+# Set `allow_public_plaintext = true` only when something Warden cannot see (an
+# ipsec/tunnel, a strictly ingress-filtered collector) protects that path: the flag
+# is an attestation of the network, and `--check` prints it as such.
+
+# ── Dead-man's-switch heartbeat (optional, STRONGLY recommended for prod) ────
+# Pinged every interval_secs; a GAP is the alarm, evaluated off-box where an
+# attacker on this host has no reach. This is what turns a silent takedown —
+# `systemctl stop warden`, SIGKILL, `docker stop`, rmmod, a reboot — into a loud
+# off-box page within one interval. Omit to disable.
+#
+# READ ONCE AT STARTUP (W-R7): like [bridge], this section is NOT re-read on
+# SIGHUP. The beat thread and its running `seq` counter were built at boot, so
+# changing `url`, `interval_secs`, `secret` or `seq_file` needs `systemctl
+# restart warden`. A reload warns and names the changed fields — never their
+# values, so the new secret is not printed into the journal — and keeps warning
+# until the restart. After restarting, look for "heartbeat thread running"; if
+# the seq could not be persisted you also get a one-time warning naming the path.
+#
+# `secret` AUTHENTICATES each beat: with it set, the beat carries seq + ts + an
+# HMAC-SHA256 over "host|seq|ts", so an attacker who reads this URL out of the
+# config cannot FORGE an "alive" ping to mask a takedown — the collector verifies
+# the MAC (origin) and that seq strictly climbs (anti-replay). Without a secret
+# the beat is forgeable; Warden logs a warning. Guard this file in
+# [[enforce.guarded_files]] (see above) so the secret itself is not root-readable.
+# The off-box collector must: verify HMAC-SHA256(secret, "host|seq|ts") == mac,
+# reject a seq <= the last seen for that host, and alarm when no valid beat
+# arrives within ~2× interval_secs. `seq_file` has to be WRITABLE under
+# ProtectSystem=strict or the seq restarts low on every reboot and the collector
+# rejects the beats — the unit's StateDirectory=warden covers the default path,
+# and Warden warns once if persistence ever fails.
+# [heartbeat]
+# url = "http://collector.internal:9000/warden/beat"
+# interval_secs = 30
+# secret = "REPLACE_WITH_A_LONG_RANDOM_SHARED_SECRET"   # also configured on the collector
+# seq_file = "/var/lib/warden/hb_seq"                     # 0600, climbs across restarts
+#
+# TRANSPORT (W2K-19): the same rule [bridge] follows. A cleartext http:// beat to a
+# PUBLICLY ROUTABLE literal IP is refused at load, because a beat anyone on path can
+# read tells an attacker when this host stopped sending them — which is the very
+# takedown the dead-man's switch exists to notice. Loopback/private/CGNAT/link-local
+# load and print their classification. A host NAME (like the example above) is
+# resolved once at startup and refused by the same rule if it answers publicly —
+# see [bridge] for the deadline and for what an unresolvable name does, which is:
+# load, and print that the path could not be classified. Unlike [bridge], the beat
+# keeps sending after a re-resolution: stopping a dead-man's switch because an
+# address moved would be read off-box as the host itself going quiet.
+# allow_public_plaintext = false    # true = attestation that the path is protected

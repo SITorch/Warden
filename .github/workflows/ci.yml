@@ -1,0 +1,196 @@
+name: warden-ci
+
+# WARDEN public Alpha CI.
+#
+# This workflow is UNPRIVILEGED. It never loads BPF, attaches LSM/cgroup
+# programs, exercises kill responders, or contacts SENTINEL. The privileged
+# runtime test is #[ignore]d and is only checked structurally here; exit 77
+# remains SKIP, never PASS. All third-party Actions are pinned to verified
+# full-length commit SHAs. Hosted execution is not claimed until a maintainer
+# runs this workflow on the actual repository.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source-gates:
+    name: Format, build, test, config and BPF integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Rust components
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head, pinned
+        with:
+          components: rustfmt, clippy
+
+      - name: Install native BPF build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          shared-key: warden-alpha1
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Compilation check
+        run: cargo check --all-targets --locked --offline
+
+      - name: Unit and integration tests
+        run: cargo test --locked --offline
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked --offline -- -D warnings
+
+      - name: Release build
+        run: cargo build --release --locked --offline
+
+      - name: BPF source-to-object rebuild integrity
+        run: |
+          make bpf
+          git diff --exit-code -- bpf/warden.bpf.o bpf/.built-from
+
+      - name: BPF object and embedded-object integrity
+        run: |
+          cargo test --locked --offline \
+            --test embedded_object_is_the_shipped_object \
+            --test capability_matrix
+
+      - name: Strict configuration validation
+        run: |
+          cargo build --locked --offline
+          ./target/debug/warden --config-validate --strict --config config/warden.example.toml
+          ./target/debug/warden --config-validate --strict --config config/warden.toml
+
+      - name: Configuration-engine CLI regressions
+        run: bash scripts/tests/test_config_engine_cli.sh "$PWD/target/debug/warden"
+
+      - name: Installer CLI regressions
+        run: bash scripts/tests/test_install_wizard.sh "$PWD/target/debug/warden"
+
+      - name: Privileged test remains skipped in ordinary CI
+        run: |
+          cargo test --locked --offline --test preopened_fd_guard -- --list \
+            | grep -q 'a_preopened_fd_loses_write_access_when_the_guard_is_armed: test'
+          bash scripts/test-privileged.sh
+          rc=$?
+          if [ "$rc" -ne 77 ]; then
+            echo "expected SKIP(77) on unprivileged CI, got $rc"
+            exit 1
+          fi
+          echo "privileged runtime test: SKIP (NOT_RUN), not PASS"
+
+      - name: SBOM format and inventory verification
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          path = Path("docs/release/warden_alpha1.spdx.json")
+          raw = path.read_bytes()
+          digest = hashlib.sha256(raw).hexdigest()
+          expected = "09dd1a06bc11ac6ac7acd995c87b9e1f251c52953f15dc9e9f3820122bdaf218"
+          if digest != expected:
+              raise SystemExit(f"SBOM digest mismatch: {digest}")
+          doc = json.loads(raw)
+          if doc.get("spdxVersion") != "SPDX-2.3":
+              raise SystemExit("unexpected SPDX version")
+          if len(doc.get("packages", [])) != 79:
+              raise SystemExit("unexpected SBOM package count")
+          if len(doc.get("relationships", [])) != 78:
+              raise SystemExit("unexpected SBOM relationship count")
+          print("SBOM verified: SPDX-2.3, 79 packages, 78 relationships")
+          PY
+
+  supply-chain:
+    name: Dependency audit and license policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head, pinned
+
+      - name: Install pinned audit tooling
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo install cargo-deny --version 0.22.1 --locked
+
+      - name: Advisory audit of the locked dependency set
+        run: cargo audit --file Cargo.lock
+
+      - name: License and bans policy
+        run: cargo deny check licenses bans
+
+  secret-scan:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history for scanning
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docs:
+    name: Documentation link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Markdown links (local targets only)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
+        with:
+          args: --no-progress --offline './**/*.md'
+          fail: true
+
+# Privileged qualification remains intentionally outside hosted CI. It belongs
+# in a maintainer-controlled disposable VM with console/out-of-band recovery and
+# explicit PASS/FAIL/SKIP/BLOCKED reporting. See scripts/test-privileged.sh and
+# docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md.
