@@ -159,6 +159,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      # Gitleaks uses the GitHub API to enumerate PR commits on pull_request
+      # events. Read-only PR metadata is sufficient; no write scope is needed.
+      pull-requests: read
     steps:
       - name: Checkout full history for scanning
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

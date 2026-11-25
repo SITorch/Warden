@@ -3,7 +3,7 @@ name = "warden"
 version = "0.1.0"
 edition = "2021"
 description = "Host-level runtime security guardian (eBPF sensors + Rust agent)"
-license = "GPL-2.0"
+license = "GPL-2.0-only"
 
 # One auditable Rust executable with a deliberately small direct dependency tree:
 # a privileged long-running security daemon should have the least code it can.

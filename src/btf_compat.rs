@@ -126,6 +126,22 @@ struct ObservedSignature {
     args: Vec<ObservedArg>,
 }
 
+/// Extract the type ids from a `FUNC_PROTO` parameter area.
+///
+/// Each parameter is a `struct btf_param { name_off, type }`, so the type id is
+/// the second u32 at bytes 4..8 of an 8-byte chunk. `slice::as_chunks::<8>()`
+/// is the stable replacement for `chunks_exact(8)`; it has the same full-chunk
+/// semantics and leaves any trailing partial bytes untouched, which the caller
+/// still detects through the declared-vs-observed argument count check.
+fn prototype_param_type_ids(extra: &[u8], vlen: usize) -> Vec<u32> {
+    let (chunks, _remainder) = extra.as_chunks::<8>();
+    chunks
+        .iter()
+        .take(vlen)
+        .map(|param| u32::from_le_bytes([param[4], param[5], param[6], param[7]]))
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct BtfReadError(pub String);
 
@@ -331,9 +347,9 @@ impl RawBtf {
                 proto.kind
             )));
         }
-        let mut args = Vec::with_capacity(proto.vlen as usize);
-        for param in proto.extra.chunks_exact(8).take(proto.vlen as usize) {
-            let type_id = u32::from_le_bytes([param[4], param[5], param[6], param[7]]);
+        let param_type_ids = prototype_param_type_ids(&proto.extra, proto.vlen as usize);
+        let mut args = Vec::with_capacity(param_type_ids.len());
+        for type_id in param_type_ids {
             args.push(self.observed_arg(type_id)?);
         }
         if args.len() != proto.vlen as usize {
@@ -699,5 +715,50 @@ mod tests {
         assert_eq!(results.len(), 6);
         assert!(results.iter().all(|r| r.status == Compatibility::Unknown));
         assert!(results.iter().all(|r| !r.status.blocks_attach()));
+    }
+
+    fn proto_param(type_id: u32) -> [u8; 8] {
+        let mut param = [0u8; 8];
+        param[4..].copy_from_slice(&type_id.to_le_bytes());
+        param
+    }
+
+    #[test]
+    fn as_chunks_parameter_extraction_preserves_exact_chunk_semantics() {
+        // One complete chunk, no remainder.
+        assert_eq!(prototype_param_type_ids(&proto_param(7), 1), vec![7]);
+
+        // Multiple complete chunks, no remainder.
+        let three = [proto_param(1), proto_param(2), proto_param(3)].concat();
+        assert_eq!(prototype_param_type_ids(&three, 3), vec![1, 2, 3]);
+
+        // A non-empty remainder must be ignored exactly as `chunks_exact` did.
+        let mut with_remainder = proto_param(9).to_vec();
+        with_remainder.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(prototype_param_type_ids(&with_remainder, 1), vec![9]);
+
+        // No complete chunks: neither an empty request nor a declared argument
+        // can manufacture a type id out of partial bytes.
+        let partial = [0xaa, 0xbb, 0xcc];
+        assert!(prototype_param_type_ids(&partial, 0).is_empty());
+        assert!(prototype_param_type_ids(&partial, 1).is_empty());
+
+        // Truncated input yields only the complete chunks; the caller's existing
+        // declared-vs-observed count check still turns that into an error.
+        let mut truncated = proto_param(1).to_vec();
+        truncated.extend_from_slice(&[0, 0]);
+        assert_eq!(prototype_param_type_ids(&truncated, 2), vec![1]);
+        assert!(prototype_param_type_ids(&[], usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn a_short_prototype_argument_area_is_still_an_explicit_incompatibility() {
+        // The parser sizes FUNC_PROTO trailing bytes as 8 * vlen, so a short
+        // area appears as a lower observed argument count. This pins the
+        // behaviour that a truncated parameter list is never a silent match.
+        let btf = RawBtf::parse(&synthetic_btf(2)).expect("synthetic BTF parses");
+        let result = check_against(&btf, VolumeHook::TcpSendMsg);
+        assert_eq!(result.status, Compatibility::Incompatible);
+        assert!(result.reason().contains("2 arguments"));
     }
 }
