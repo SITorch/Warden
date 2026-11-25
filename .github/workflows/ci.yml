@@ -95,8 +95,8 @@ jobs:
         run: |
           cargo test --locked --offline --test preopened_fd_guard -- --list \
             | grep -q 'a_preopened_fd_loses_write_access_when_the_guard_is_armed: test'
-          bash scripts/test-privileged.sh
-          rc=$?
+          rc=0
+          bash scripts/test-privileged.sh || rc=$?
           if [ "$rc" -ne 77 ]; then
             echo "expected SKIP(77) on unprivileged CI, got $rc"
             exit 1
@@ -159,6 +159,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      # Gitleaks uses the GitHub API to enumerate PR commits on pull_request
+      # events. Read-only PR metadata is sufficient; no write scope is needed.
+      pull-requests: read
     steps:
       - name: Checkout full history for scanning
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
