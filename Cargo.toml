@@ -35,7 +35,7 @@ path = "src/main.rs"
 # very object the binary embeds — a comment claiming a counter cannot fail, that
 # test can.
 [dev-dependencies]
-aya-obj = "0.2"
+aya-obj = "0.6"
 
 [profile.release]
 opt-level = 3
