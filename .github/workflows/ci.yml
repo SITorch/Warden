@@ -95,8 +95,8 @@ jobs:
         run: |
           cargo test --locked --offline --test preopened_fd_guard -- --list \
             | grep -q 'a_preopened_fd_loses_write_access_when_the_guard_is_armed: test'
-          bash scripts/test-privileged.sh
-          rc=$?
+          rc=0
+          bash scripts/test-privileged.sh || rc=$?
           if [ "$rc" -ne 77 ]; then
             echo "expected SKIP(77) on unprivileged CI, got $rc"
             exit 1
