@@ -2991,7 +2991,9 @@ mod tests {
         f04_inject(&spool, RewriteFaultStage::TempCreate);
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t02", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
 
         let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
@@ -3020,7 +3022,9 @@ mod tests {
         );
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t03", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
 
         let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
@@ -3047,7 +3051,9 @@ mod tests {
         );
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t04", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
 
         let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
@@ -3069,7 +3075,9 @@ mod tests {
         f04_inject(&spool, RewriteFaultStage::TempSync);
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t05", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
 
         let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
@@ -3090,7 +3098,9 @@ mod tests {
         f04_inject(&spool, RewriteFaultStage::Rename);
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t06", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
 
         let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
@@ -3217,7 +3227,9 @@ mod tests {
         f04_inject(&spool, RewriteFaultStage::TempSync);
         let (survivors, remaining) =
             isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t11-fail", 5);
-        assert_eq!(remaining, 2);
+        // 5 spooled rows minus the 2 named rows = 3 spooled survivors. This
+        // value is the same on success and rollback, which is the F04 fix.
+        assert_eq!(remaining, 3);
         f04_retry(&spool, &c, survivors, remaining);
         assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
 
@@ -3297,6 +3309,7 @@ mod tests {
             &c,
         );
         // Index 2 is deliberately duplicated: accounting must be set-based.
+        // Index 8 is c0 (rejected); c1 is the channel-only survivor.
         let rejected = f04_rejections(&batch, &[0, 2, 2, 5, 8]);
 
         let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t14", 8);
@@ -3306,11 +3319,11 @@ mod tests {
                 .iter()
                 .map(|r| r.event_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["e1", "e3", "e4", "e6", "e7", "c0"]
+            vec!["e1", "e3", "e4", "e6", "e7", "c1"]
         );
         f04_retry(&spool, &c, survivors, remaining);
 
-        let expected = vec!["e1", "e3", "e4", "e6", "e7", "c0"];
+        let expected = vec!["e1", "e3", "e4", "e6", "e7", "c1"];
         assert_eq!(f04_queue_ids(&spool), expected);
         assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
         assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
