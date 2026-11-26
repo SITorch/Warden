@@ -3385,6 +3385,71 @@ mod tests {
         }
     }
 
+    /// T16: a failed rewrite keeps the named rows in the spool. When Sentinel
+    /// names those same rows again on the next retry, they must not be appended
+    /// to the dead-letter file a second time: that file is the set of findings
+    /// awaiting operator replay, not a log of how many retries failed.
+    #[test]
+    fn f04_t16_repeated_isolate_failures_do_not_duplicate_dead_letters() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) = f04_setup("t16", &["e0", "e1", "e2", "e3", "e4"], &[], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]); // e1 and e3, stable across retries
+        let qpath = quarantine_path(&cfg);
+        let expected_spool = vec!["e0", "e1", "e2", "e3", "e4"];
+
+        for attempt in 1..=3 {
+            f04_inject(&spool, RewriteFaultStage::Rename);
+            let (survivors, remaining) =
+                isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t16", 5);
+            assert_eq!(remaining, 3, "attempt {attempt}");
+            assert_eq!(
+                survivors
+                    .iter()
+                    .map(|r| r.event_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["e0", "e2", "e4"],
+                "attempt {attempt}"
+            );
+            // The worker's caller-side rule: only survivors beyond the still
+            // spooled ones are re-spooled. Here none are, because the rewrite
+            // rolled back and every row is still on disk.
+            f04_retry(&spool, &c, survivors, remaining);
+            assert_eq!(f04_queue_ids(&spool), expected_spool, "attempt {attempt}");
+            assert_eq!(
+                f04_durable_ids(&cfg.spool_path),
+                expected_spool,
+                "attempt {attempt}"
+            );
+            f04_assert_no_tmp(&cfg.spool_path);
+        }
+
+        // Two distinct findings, each dead-lettered exactly once, despite three
+        // failed isolation attempts that named the same event IDs.
+        let text = std::fs::read_to_string(&qpath).expect("dead-letter file is readable");
+        let ids: Vec<String> = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let v: serde_json::Value =
+                    serde_json::from_str(line).expect("dead-letter line is JSON");
+                v["event_id"]
+                    .as_str()
+                    .expect("dead-letter line has an event_id")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["e1", "e3"],
+            "the same finding must not be dead-lettered twice"
+        );
+        assert_eq!(c.quarantined.load(Ordering::Relaxed), 2);
+        assert_eq!(c.isolated.load(Ordering::Relaxed), 3);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 3);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn replay_moves_dead_letters_back_to_the_spool_and_archives_the_file() {
         let dir = temp_dir("replay");
