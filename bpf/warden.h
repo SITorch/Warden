@@ -535,7 +535,10 @@ enum warden_cfg_slot {
  * the generation that programmed it. There is no wildcard-by-name rule and no
  * mutable container-name matching: a deny must be attributable to an address an
  * operator can read. `port == 0` means "any port for this address", which is the
- * only wildcard the kernel side understands.
+ * only wildcard the kernel side understands. An IPv4-mapped IPv6 address
+ * (`::ffff:a.b.c.d`) is canonicalized to its AF_INET key by both producers:
+ * userspace `EgressDeny::to_key()` and the BPF v6 observation path. Native IPv6
+ * outside that exact prefix keeps its AF_INET6 key.
  *
  * The userspace writer is the ONLY producer of this map. A failed update never
  * replaces a generation that was previously valid — see src/egress.rs. */

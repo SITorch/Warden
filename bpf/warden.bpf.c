@@ -2067,6 +2067,18 @@ static __always_inline int egress_decide_v6(struct bpf_sock_addr *ctx)
 	__builtin_memcpy(&addr[4], &w1, 4);
 	__builtin_memcpy(&addr[8], &w2, 4);
 	__builtin_memcpy(&addr[12], &w3, 4);
+
+	/* F06: an IPv4-mapped IPv6 endpoint is the same logical IPv4 endpoint an
+	 * operator writes as `a.b.c.d`. Canonicalize the exact mapped prefix here,
+	 * before the key is built, so an AF_INET deny cannot be bypassed by the v6
+	 * hook. Bytes 0..9 zero and bytes 10..11 0xffff are the complete mapped
+	 * prefix; every other IPv6 address keeps its AF_INET6 key. */
+	if (addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0 &&
+	    addr[4] == 0 && addr[5] == 0 && addr[6] == 0 && addr[7] == 0 &&
+	    addr[8] == 0 && addr[9] == 0 && addr[10] == 0xff && addr[11] == 0xff)
+		return egress_decide(AF_INET, ctx->protocol, 4, &addr[12],
+				     ctx->user_port);
+
 	return egress_decide(AF_INET6, ctx->protocol, 16, addr, ctx->user_port);
 }
 
