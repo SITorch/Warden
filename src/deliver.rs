@@ -125,6 +125,9 @@ struct Counters {
     /// are awaiting an operator fix + replay — so they are counted apart from
     /// `permanent` and `dropped`.
     quarantined: AtomicU64,
+    /// Rewrite attempts that failed and were rolled back. They are not losses,
+    /// but they are explicit, observable spool-integrity events.
+    spool_rewrite_failures: AtomicU64,
     /// Written durably to the spool.
     spooled: AtomicU64,
     /// LOST. Full spool, failed spool write, unserializable finding, or a dead
@@ -276,6 +279,34 @@ struct Spool {
     /// cap exists to bound disk, so it has to be the disk number.
     file_bytes: u64,
     max_bytes: u64,
+    /// Test-only deterministic fault injection. It is per-Spool, not global, so
+    /// tests run in parallel without affecting one another. Production builds
+    /// have neither the field nor any of the injection branches.
+    #[cfg(test)]
+    rewrite_fault: Option<RewriteFault>,
+}
+
+/// A deterministic failure injected into one pre-publication rewrite step.
+/// There is deliberately no post-rename variant: the rewrite has no fallible
+/// operation after `rename`, so there is no ambiguous durable state to inject.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RewriteFaultStage {
+    TempCreate,
+    TempPermissions,
+    TempWrite {
+        after_bytes: u64,
+        kind: std::io::ErrorKind,
+    },
+    TempSync,
+    TempHandle,
+    Rename,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct RewriteFault {
+    stage: RewriteFaultStage,
 }
 
 impl Spool {
@@ -342,6 +373,8 @@ impl Spool {
             delivered: 0,
             file_bytes,
             max_bytes,
+            #[cfg(test)]
+            rewrite_fault: None,
         })
     }
 
@@ -436,6 +469,80 @@ impl Spool {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn inject_rewrite_fault(&mut self, stage: RewriteFaultStage) {
+        self.rewrite_fault = Some(RewriteFault { stage });
+    }
+
+    #[cfg(test)]
+    fn clear_rewrite_fault(&mut self) {
+        self.rewrite_fault = None;
+    }
+
+    #[cfg(test)]
+    fn fault_at(&self, stage: RewriteFaultStage) -> std::io::Result<()> {
+        if self
+            .rewrite_fault
+            .map(|fault| fault.stage == stage)
+            .unwrap_or(false)
+        {
+            let kind = match stage {
+                RewriteFaultStage::TempCreate | RewriteFaultStage::TempHandle => {
+                    std::io::ErrorKind::AlreadyExists
+                }
+                RewriteFaultStage::TempPermissions | RewriteFaultStage::Rename => {
+                    std::io::ErrorKind::PermissionDenied
+                }
+                RewriteFaultStage::TempSync => std::io::ErrorKind::Other,
+                RewriteFaultStage::TempWrite { .. } => std::io::ErrorKind::UnexpectedEof,
+            };
+            return Err(std::io::Error::new(
+                kind,
+                format!("injected rewrite fault at {stage:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn write_tmp_chunk(
+        &self,
+        out: &mut File,
+        chunk: &[u8],
+        bytes: &mut u64,
+    ) -> std::io::Result<()> {
+        if let Some(fault) = self.rewrite_fault {
+            if let RewriteFaultStage::TempWrite { after_bytes, kind } = fault.stage {
+                let remaining = after_bytes.saturating_sub(*bytes);
+                if remaining <= chunk.len() as u64 {
+                    // Write a deterministic partial record, then fail. The
+                    // published spool is untouched; only the scratch file can
+                    // be torn, and it is discarded on the error path.
+                    let n = remaining as usize;
+                    out.write_all(&chunk[..n])?;
+                    *bytes += n as u64;
+                    return Err(std::io::Error::new(
+                        kind,
+                        "injected spool rewrite write failure",
+                    ));
+                }
+            }
+        }
+        out.write_all(chunk)?;
+        *bytes += chunk.len() as u64;
+        Ok(())
+    }
+
+    fn discard_rewrite_tmp(path: &Path) {
+        // Only ever remove the scratch name. A directory left by a failure
+        // injection (or by a damaged host) is isolated rather than deleted.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_file() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     /// Rewrite the file with exactly the records still in `queued`, atomically.
     /// Shared by `compact` (drop the delivered prefix) and `drop_front_indices`
     /// (drop findings Sentinel named in a 400 — they are dead-lettered instead).
@@ -444,41 +551,87 @@ impl Spool {
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
 
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        let mut bytes = 0u64;
-        for rec in &self.queued {
-            out.write_all(&rec.body)?;
-            out.write_all(b"\n")?;
-            bytes += rec.body.len() as u64 + 1;
-        }
-        // fsync the new file before the rename, so the rename can never publish
-        // a name whose contents are not yet on the platter.
-        out.sync_all()?;
-        // Open the replacement handle while the file still has its temporary
-        // name. After the rename there is no fallible operation left: every
-        // error happens before publication, so a failed rewrite can never
-        // leave the spool file changed while the caller rolls back the queue.
-        let file = OpenOptions::new().read(true).append(true).open(&tmp)?;
-        drop(out);
-        std::fs::rename(&tmp, &self.path)?;
-        // Best-effort directory fsync: without it the rename itself can be lost
-        // on a crash. Cheap, and the failure mode is only "one extra
-        // redelivery", which the event id absorbs.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
+        // Every fallible operation happens before publication. Once rename has
+        // succeeded only the in-memory assignment remains, so a rewrite error
+        // can never pair a rolled-back queue with a changed durable file.
+        let result = (|| -> std::io::Result<(File, u64)> {
+            #[cfg(test)]
+            {
+                self.fault_at(RewriteFaultStage::TempCreate)?;
+            }
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            // `.mode(0o600)` only applies at creation. Tighten a stale scratch
+            // file too, before any finding bytes are written to it.
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            #[cfg(test)]
+            {
+                self.fault_at(RewriteFaultStage::TempPermissions)?;
+            }
+            let mut bytes = 0u64;
+            for rec in &self.queued {
+                #[cfg(test)]
+                {
+                    self.write_tmp_chunk(&mut out, &rec.body, &mut bytes)?;
+                    self.write_tmp_chunk(&mut out, b"\n", &mut bytes)?;
+                }
+                #[cfg(not(test))]
+                {
+                    out.write_all(&rec.body)?;
+                    out.write_all(b"\n")?;
+                    bytes += rec.body.len() as u64 + 1;
+                }
+            }
+            // fsync the new file before the rename, so the rename can never
+            // publish a name whose contents are not yet on the platter.
+            #[cfg(test)]
+            {
+                self.fault_at(RewriteFaultStage::TempSync)?;
+            }
+            out.sync_all()?;
+            // Open the replacement handle while the file still has its
+            // temporary name. After the rename there is no fallible operation
+            // left: every error happens before publication, so a failed
+            // rewrite can never leave the spool file changed while the caller
+            // rolls back the queue.
+            #[cfg(test)]
+            {
+                self.fault_at(RewriteFaultStage::TempHandle)?;
+            }
+            let file = OpenOptions::new().read(true).append(true).open(&tmp)?;
+            drop(out);
+            #[cfg(test)]
+            {
+                self.fault_at(RewriteFaultStage::Rename)?;
+            }
+            std::fs::rename(&tmp, &self.path)?;
+            // Best-effort directory fsync: without it the rename itself can be
+            // lost on a crash. Cheap, and the failure mode is only "one extra
+            // redelivery", which the event id absorbs.
+            if let Some(dir) = self.path.parent() {
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok((file, bytes))
+        })();
+
+        match result {
+            Ok((file, bytes)) => {
+                self.file = file;
+                self.file_bytes = bytes;
+                self.delivered = 0;
+                Ok(())
+            }
+            Err(e) => {
+                Self::discard_rewrite_tmp(&tmp);
+                Err(e)
             }
         }
-
-        self.file = file;
-        self.file_bytes = bytes;
-        self.delivered = 0;
-        Ok(())
     }
 
     /// Rewrite the file with only the undelivered records, atomically.
@@ -1071,23 +1224,47 @@ fn isolate_batch(
     let bad: Vec<usize> = rejected.iter().map(|r| r.index).collect();
     let written = quarantine_records(cfg, rejected, c);
     c.isolated.fetch_add(1, Ordering::Relaxed);
-    let spool_bad: Vec<usize> = bad.iter().copied().filter(|i| *i < spooled_n).collect();
-    let removed = match lock(spool).drop_front_indices(&spool_bad) {
-        Ok(n) => n,
-        Err(e) => {
-            log::error!("bridge: removing isolated findings from the spool failed ({e})");
-            // The rewrite is transactional, so those rows are still at the front
-            // of the spool. Skip exactly that many survivors; skipping none would
-            // append spooled survivors a second time.
-            spool_bad.len()
-        }
-    };
+
+    // Duplicate named indices are harmless to the survivor filter but would
+    // overstate a length-based removal count. Normalise once at the boundary.
+    let mut spool_bad: Vec<usize> = bad.iter().copied().filter(|i| *i < spooled_n).collect();
+    spool_bad.sort_unstable();
+    spool_bad.dedup();
+
+    // Count survivors directly from the batch. This is correct whether the
+    // rewrite succeeds or rolls back, so the error arm cannot inflate the
+    // number of spooled rows the caller may skip.
+    let surviving_spooled = batch
+        .iter()
+        .take(spooled_n)
+        .enumerate()
+        .filter(|(i, _)| !bad.contains(i))
+        .count();
+    let rewrite_result = lock(spool).drop_front_indices(&spool_bad);
+
     let survivors: Vec<Record> = batch
         .iter()
         .enumerate()
         .filter(|(i, _)| !bad.contains(i))
         .map(|(_, r)| r.clone())
         .collect();
+    let channel_survivors = survivors.len().saturating_sub(surviving_spooled);
+
+    if let Err(e) = &rewrite_result {
+        let n = c
+            .spool_rewrite_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        log::error!(
+            "bridge: spool rewrite failed while isolating {} named finding(s) ({e}); original \
+             spool and queue retained, {} spooled survivor(s) and {} channel-only survivor(s) \
+             preserved, no finding dropped (failure #{n})",
+            spool_bad.len(),
+            surviving_spooled,
+            channel_survivors
+        );
+    }
+
     log::error!(
         "bridge: {detail}; {} named finding(s) dead-lettered to {} ({} written, {} lost), \
          the other {} will be retried",
@@ -1097,7 +1274,7 @@ fn isolate_batch(
         rejected.len().saturating_sub(written),
         survivors.len()
     );
-    (survivors, spooled_n.saturating_sub(removed))
+    (survivors, surviving_spooled)
 }
 
 fn worker(
@@ -2675,6 +2852,521 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e0", "e1", "e2", "e3", "c0"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // F04 deterministic fault-injection matrix (T01–T15).
+    //
+    // Faults are injected into the spool rewrite's storage boundary, per Spool
+    // instance, before the atomic rename. No host disk exhaustion, privilege,
+    // mount, signal or external path is involved. The caller-side retry rule
+    // (`survivors.skip(remaining_spooled)`) is applied explicitly so the test
+    // observes the same state transition the worker would produce.
+    // ---------------------------------------------------------------------
+
+    fn f04_setup(
+        tag: &str,
+        spooled: &[&str],
+        channel: &[&str],
+        c: &Counters,
+    ) -> (PathBuf, Bridge, Arc<Mutex<Spool>>, Vec<Record>) {
+        let dir = temp_dir(tag);
+        let cfg = cfg_for("http://127.0.0.1:9/api/", &dir);
+        let spool = Arc::new(Mutex::new(
+            Spool::open(&cfg.spool_path, cfg.spool_max_bytes).unwrap(),
+        ));
+        for id in spooled {
+            spool_one(&spool, c, record(id));
+        }
+        let mut batch = lock(&spool).front_batch(spooled.len());
+        for id in channel {
+            batch.push(record(id));
+        }
+        (dir, cfg, spool, batch)
+    }
+
+    fn f04_rejections(batch: &[Record], indices: &[usize]) -> Vec<RejectedRecord> {
+        indices
+            .iter()
+            .map(|&index| {
+                let rec = &batch[index];
+                RejectedRecord {
+                    index,
+                    event_id: rec.event_id.clone(),
+                    body: rec.body.clone(),
+                    reason: "contract".to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn f04_inject(spool: &Arc<Mutex<Spool>>, stage: RewriteFaultStage) {
+        lock(spool).inject_rewrite_fault(stage);
+    }
+
+    fn f04_clear(spool: &Arc<Mutex<Spool>>) {
+        lock(spool).clear_rewrite_fault();
+    }
+
+    fn f04_queue_ids(spool: &Arc<Mutex<Spool>>) -> Vec<String> {
+        lock(spool)
+            .queued
+            .iter()
+            .map(|r| r.event_id.clone())
+            .collect()
+    }
+
+    fn f04_durable_ids(path: &Path) -> Vec<String> {
+        let text = std::fs::read_to_string(path).expect("durable spool is readable");
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                parse_spool_line(line.as_bytes())
+                    .unwrap_or_else(|| panic!("unparseable durable spool line: {line:?}"))
+                    .event_id
+            })
+            .collect()
+    }
+
+    fn f04_tmp_path(spool_path: &Path) -> PathBuf {
+        let mut tmp = spool_path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
+    }
+
+    fn f04_assert_no_tmp(spool_path: &Path) {
+        assert!(
+            !f04_tmp_path(spool_path).exists(),
+            "rewrite scratch must not be left published or half-written"
+        );
+    }
+
+    fn f04_retry(
+        spool: &Arc<Mutex<Spool>>,
+        c: &Counters,
+        survivors: Vec<Record>,
+        remaining_spooled: usize,
+    ) {
+        for rec in survivors.into_iter().skip(remaining_spooled) {
+            spool_one(spool, c, rec);
+        }
+    }
+
+    #[test]
+    fn f04_t01_successful_rewrite_preserves_all_non_rejected_records() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t01", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t01", 5);
+        assert_eq!(remaining, 3);
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e0", "e2", "e4", "c0"]
+        );
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e2", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.isolated.load(Ordering::Relaxed), 1);
+        assert_eq!(c.quarantined.load(Ordering::Relaxed), 2);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 6);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 0);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t02_temp_file_creation_failure_rolls_back_everything() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t02", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        f04_inject(&spool, RewriteFaultStage::TempCreate);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t02", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 6);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t03_partial_temp_write_failure_leaves_published_spool_intact() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t03", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        let after_bytes = record("e0").body.len() as u64 + 1 + 7;
+        f04_inject(
+            &spool,
+            RewriteFaultStage::TempWrite {
+                after_bytes,
+                kind: std::io::ErrorKind::UnexpectedEof,
+            },
+        );
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t03", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t04_enospc_during_write_preserves_retry_state() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t04", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        f04_inject(
+            &spool,
+            RewriteFaultStage::TempWrite {
+                after_bytes: 0,
+                kind: std::io::ErrorKind::StorageFull,
+            },
+        );
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t04", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 6);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t05_fsync_failure_does_not_commit_the_queue() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t05", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        f04_inject(&spool, RewriteFaultStage::TempSync);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t05", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t06_rename_failure_keeps_the_original_spool_path_valid() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t06", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        f04_inject(&spool, RewriteFaultStage::Rename);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t06", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t07_no_post_rename_reopen_failure_window() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t07", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        // The replacement handle is opened before rename, so this is the last
+        // fallible handle operation. A failure here leaves the old descriptor
+        // and the old path in agreement; there is no post-rename reopen to
+        // fail after the durable name has already changed.
+        f04_inject(&spool, RewriteFaultStage::TempHandle);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t07", 5);
+        f04_retry(&spool, &c, survivors, remaining);
+        spool_one(&spool, &c, record("c1"));
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0", "c1"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t08_mixed_batch_rewrite_failure_distinguishes_every_class() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) = f04_setup(
+            "t08",
+            &["e0", "e1", "e2", "e3", "e4", "e5"],
+            &["c0", "c1"],
+            &c,
+        );
+        // e1/e5 are named spooled rows, c1 is a named channel-only row.
+        // e0/e2/e3/e4 and c0 must survive.
+        let rejected = f04_rejections(&batch, &[1, 5, 7]);
+        f04_inject(&spool, RewriteFaultStage::TempCreate);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t08", 6);
+        assert_eq!(remaining, 4);
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e0", "e2", "e3", "e4", "c0"]
+        );
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e1", "e2", "e3", "e4", "e5", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 7);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t09_repeated_failures_then_success_have_no_cumulative_loss() {
+        let dir = temp_dir("t09");
+        let spool_path = dir.join("s.jsonl");
+        let mut spool = Spool::open(&spool_path, 1 << 20).unwrap();
+        for id in ["e0", "e1", "e2", "e3", "e4"] {
+            spool.append(record(id)).unwrap();
+        }
+
+        for _ in 0..3 {
+            spool.inject_rewrite_fault(RewriteFaultStage::TempCreate);
+            assert!(spool.drop_front_indices(&[1, 3]).is_err());
+            let ids: Vec<String> = spool.queued.iter().map(|r| r.event_id.clone()).collect();
+            assert_eq!(ids, vec!["e0", "e1", "e2", "e3", "e4"]);
+            assert_eq!(f04_durable_ids(&spool_path), ids);
+            f04_assert_no_tmp(&spool_path);
+        }
+
+        spool.clear_rewrite_fault();
+        assert_eq!(spool.drop_front_indices(&[1, 3]).unwrap(), 2);
+        let ids: Vec<String> = spool.queued.iter().map(|r| r.event_id.clone()).collect();
+        assert_eq!(ids, vec!["e0", "e2", "e4"]);
+        assert_eq!(f04_durable_ids(&spool_path), ids);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t10_restart_after_failure_recovers_every_record() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t10", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+        f04_inject(&spool, RewriteFaultStage::Rename);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t10", 5);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let reopened = Spool::open(&cfg.spool_path, cfg.spool_max_bytes).unwrap();
+        let recovered: Vec<String> = reopened.queued.iter().map(|r| r.event_id.clone()).collect();
+        assert_eq!(recovered, vec!["e0", "e1", "e2", "e3", "e4", "c0"]);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t11_successful_rewrite_after_prior_failure_converges() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) =
+            f04_setup("t11", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1, 3]);
+
+        f04_inject(&spool, RewriteFaultStage::TempSync);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t11-fail", 5);
+        assert_eq!(remaining, 2);
+        f04_retry(&spool, &c, survivors, remaining);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+
+        f04_clear(&spool);
+        // c0 is now the sixth durable record, so all six are spooled on retry.
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t11-retry", 6);
+        assert_eq!(remaining, 4);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e0", "e2", "e4", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 6);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t12_counters_never_treat_a_rewrite_failure_as_a_drop() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) = f04_setup("t12", &["e0", "e1", "e2", "e3"], &["c0"], &c);
+        let rejected = f04_rejections(&batch, &[1]);
+        f04_inject(&spool, RewriteFaultStage::TempCreate);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t12", 4);
+        f04_retry(&spool, &c, survivors, remaining);
+
+        assert_eq!(f04_queue_ids(&spool), vec!["e0", "e1", "e2", "e3", "c0"]);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.isolated.load(Ordering::Relaxed), 1);
+        assert_eq!(c.quarantined.load(Ordering::Relaxed), 1);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 5);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(c.pending_on_disk.load(Ordering::Relaxed), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t13_empty_spool_never_invents_a_channel_skip_count() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) = f04_setup("t13", &[], &["c0", "c1"], &c);
+        let rejected = f04_rejections(&batch, &[0]);
+        // Even with a fault armed, no rewrite is attempted when no spooled row
+        // is named, so neither channel-only finding can be consumed by a skip.
+        f04_inject(&spool, RewriteFaultStage::TempCreate);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t13", 0);
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1"]
+        );
+        f04_retry(&spool, &c, survivors, remaining);
+
+        assert_eq!(f04_queue_ids(&spool), vec!["c1"]);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), vec!["c1"]);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spooled.load(Ordering::Relaxed), 1);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 0);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t14_interleaved_rejections_and_duplicate_indices_keep_order() {
+        let c = Counters::default();
+        let (dir, cfg, spool, batch) = f04_setup(
+            "t14",
+            &["e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7"],
+            &["c0", "c1"],
+            &c,
+        );
+        // Index 2 is deliberately duplicated: accounting must be set-based.
+        let rejected = f04_rejections(&batch, &[0, 2, 2, 5, 8]);
+
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t14", 8);
+        assert_eq!(remaining, 5);
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e1", "e3", "e4", "e6", "e7", "c0"]
+        );
+        f04_retry(&spool, &c, survivors, remaining);
+
+        let expected = vec!["e1", "e3", "e4", "e6", "e7", "c0"];
+        assert_eq!(f04_queue_ids(&spool), expected);
+        assert_eq!(f04_durable_ids(&cfg.spool_path), expected);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 0);
+        f04_assert_no_tmp(&cfg.spool_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f04_t15_every_injected_failure_leaves_an_atomic_parseable_spool() {
+        let faults = vec![
+            RewriteFaultStage::TempCreate,
+            RewriteFaultStage::TempPermissions,
+            RewriteFaultStage::TempWrite {
+                after_bytes: 5,
+                kind: std::io::ErrorKind::UnexpectedEof,
+            },
+            RewriteFaultStage::TempWrite {
+                after_bytes: 0,
+                kind: std::io::ErrorKind::StorageFull,
+            },
+            RewriteFaultStage::TempSync,
+            RewriteFaultStage::TempHandle,
+            RewriteFaultStage::Rename,
+        ];
+
+        for (i, stage) in faults.into_iter().enumerate() {
+            let c = Counters::default();
+            let (dir, cfg, spool, batch) = f04_setup(
+                &format!("t15-{i}"),
+                &["e0", "e1", "e2", "e3", "e4"],
+                &["c0"],
+                &c,
+            );
+            let rejected = f04_rejections(&batch, &[1, 3]);
+            f04_inject(&spool, stage);
+
+            let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t15", 5);
+            f04_retry(&spool, &c, survivors, remaining);
+
+            let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
+            assert_eq!(f04_queue_ids(&spool), expected, "fault {i}");
+            assert_eq!(f04_durable_ids(&cfg.spool_path), expected, "fault {i}");
+            assert_eq!(c.dropped.load(Ordering::Relaxed), 0, "fault {i}");
+            assert_eq!(
+                c.spool_rewrite_failures.load(Ordering::Relaxed),
+                1,
+                "fault {i}"
+            );
+            let mode = std::fs::metadata(&cfg.spool_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "fault {i}");
+            f04_assert_no_tmp(&cfg.spool_path);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
