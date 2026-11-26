@@ -459,6 +459,11 @@ impl Spool {
         // fsync the new file before the rename, so the rename can never publish
         // a name whose contents are not yet on the platter.
         out.sync_all()?;
+        // Open the replacement handle while the file still has its temporary
+        // name. After the rename there is no fallible operation left: every
+        // error happens before publication, so a failed rewrite can never
+        // leave the spool file changed while the caller rolls back the queue.
+        let file = OpenOptions::new().read(true).append(true).open(&tmp)?;
         drop(out);
         std::fs::rename(&tmp, &self.path)?;
         // Best-effort directory fsync: without it the rename itself can be lost
@@ -470,14 +475,7 @@ impl Spool {
             }
         }
 
-        // Re-open: the old handle points at the now-unlinked inode, and writes
-        // through it would grow a file nothing can ever read.
-        self.file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&self.path)?;
+        self.file = file;
         self.file_bytes = bytes;
         self.delivered = 0;
         Ok(())
@@ -2588,6 +2586,38 @@ mod tests {
         let ids: Vec<String> = spool.queued.iter().map(|r| r.event_id.clone()).collect();
         assert_eq!(ids, vec!["e0", "e1", "e2", "e3", "e4"]);
         assert_eq!(std::fs::read_to_string(&spool_path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_leaves_the_append_handle_on_the_published_file() {
+        let dir = temp_dir("rewrite-handle");
+        let spool_path = dir.join("s.jsonl");
+        let mut spool = Spool::open(&spool_path, 1 << 20).unwrap();
+        for i in 0..3 {
+            spool
+                .append(Record {
+                    event_id: format!("e{i}"),
+                    body: format!("{{\"event_id\":\"e{i}\"}}").into_bytes(),
+                })
+                .unwrap();
+        }
+        spool.pop_delivered();
+        assert_eq!(spool.drop_front_indices(&[0]).unwrap(), 1);
+        spool
+            .append(Record {
+                event_id: "e3".to_string(),
+                body: br#"{"event_id":"e3"}"#.to_vec(),
+            })
+            .unwrap();
+        let disk = std::fs::read_to_string(&spool_path).unwrap();
+        assert_eq!(
+            disk.lines().count(),
+            2,
+            "append must land on the renamed file"
+        );
+        assert!(disk.contains("\"event_id\":\"e2\""));
+        assert!(disk.contains("\"event_id\":\"e3\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
