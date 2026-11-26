@@ -1727,9 +1727,10 @@ mod tests {
             self_exe: Some("/usr/local/sbin/warden".to_string()),
             build_version: "0.1.0".to_string(),
             // PRQ-01 public-release object: rebuilt with -fdebug-prefix-map to
-            // remove builder paths. Refresh from `warden --version` after make bpf.
-            build_obj_len: 1_243_656,
-            build_obj_digest: 0xbc28_8747_047b_4edb,
+            // remove builder paths. Refreshed for the F06 rebuild; see
+            // `warden --version` after make bpf.
+            build_obj_len: 1_249_648,
+            build_obj_digest: 0x652c_502c_9161_9025,
         }
     }
 
