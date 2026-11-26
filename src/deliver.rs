@@ -500,6 +500,10 @@ impl Spool {
         if indices.is_empty() {
             return Ok(0);
         }
+        // Keep the original queue until the rewrite succeeds: a failed rewrite
+        // must not drop rows from memory while leaving them on disk, because
+        // the caller would then skip survivors that are still queued.
+        let original = self.queued.clone();
         let mut kept = VecDeque::with_capacity(self.queued.len());
         let mut removed = 0;
         for (i, rec) in std::mem::take(&mut self.queued).into_iter().enumerate() {
@@ -511,7 +515,10 @@ impl Spool {
         }
         self.queued = kept;
         if removed > 0 {
-            self.rewrite()?;
+            if let Err(e) = self.rewrite() {
+                self.queued = original;
+                return Err(e);
+            }
         }
         Ok(removed)
     }
@@ -1071,7 +1078,10 @@ fn isolate_batch(
         Ok(n) => n,
         Err(e) => {
             log::error!("bridge: removing isolated findings from the spool failed ({e})");
-            0
+            // The rewrite is transactional, so those rows are still at the front
+            // of the spool. Skip exactly that many survivors; skipping none would
+            // append spooled survivors a second time.
+            spool_bad.len()
         }
     };
     let survivors: Vec<Record> = batch
@@ -2554,6 +2564,86 @@ mod tests {
         assert!(!text.contains("e1"), "{text}");
         assert!(!text.contains("e3"), "{text}");
         assert!(text.contains("e2") && text.contains("e4"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_front_indices_restores_the_queue_when_rewrite_fails() {
+        let dir = temp_dir("drop-indices-failure");
+        let spool_path = dir.join("s.jsonl");
+        let mut spool = Spool::open(&spool_path, 1 << 20).unwrap();
+        for i in 0..5 {
+            spool
+                .append(Record {
+                    event_id: format!("e{i}"),
+                    body: format!("{{\"event_id\":\"e{i}\"}}").into_bytes(),
+                })
+                .unwrap();
+        }
+        let before = std::fs::read_to_string(&spool_path).unwrap();
+        // A directory at the rewrite temp path makes the rewrite fail before any
+        // file is replaced: the in-memory queue must not lose those rows either.
+        std::fs::create_dir(format!("{}.tmp", spool_path.display())).unwrap();
+        assert!(spool.drop_front_indices(&[1, 3]).is_err());
+        let ids: Vec<String> = spool.queued.iter().map(|r| r.event_id.clone()).collect();
+        assert_eq!(ids, vec!["e0", "e1", "e2", "e3", "e4"]);
+        assert_eq!(std::fs::read_to_string(&spool_path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolate_batch_rewrite_failure_keeps_channel_survivors_without_duplicates() {
+        let dir = temp_dir("isolate-failure");
+        let cfg = cfg_for("http://127.0.0.1:9/api/", &dir);
+        let spool = Arc::new(Mutex::new(
+            Spool::open(&cfg.spool_path, cfg.spool_max_bytes).unwrap(),
+        ));
+        let mut batch = Vec::new();
+        for i in 0..4 {
+            let rec = Record {
+                event_id: format!("e{i}"),
+                body: format!("{{\"event_id\":\"e{i}\"}}").into_bytes(),
+            };
+            lock(&spool).append(rec.clone()).unwrap();
+            batch.push(rec);
+        }
+        let channel = Record {
+            event_id: "c0".to_string(),
+            body: br#"{"event_id":"c0"}"#.to_vec(),
+        };
+        batch.push(channel.clone());
+        std::fs::create_dir(format!("{}.tmp", cfg.spool_path.display())).unwrap();
+        let rejected = vec![1usize, 3]
+            .into_iter()
+            .map(|index| RejectedRecord {
+                index,
+                event_id: format!("e{index}"),
+                body: format!("{{\"event_id\":\"e{index}\"}}").into_bytes(),
+                reason: "x".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let c = Counters::default();
+        let (survivors, remaining) =
+            isolate_batch(&cfg, &c, &spool, &batch, &rejected, "test detail", 4);
+        assert_eq!(remaining, 2, "both spooled bad rows are still queued");
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e0", "e2", "c0"]
+        );
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+        // Apply the caller's skip rule: only the channel-only survivor is new.
+        for rec in survivors.into_iter().skip(remaining) {
+            spool_one(&spool, &c, rec);
+        }
+        let ids: Vec<String> = lock(&spool)
+            .queued
+            .iter()
+            .map(|r| r.event_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["e0", "e1", "e2", "e3", "c0"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
