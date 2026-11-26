@@ -2959,7 +2959,7 @@ mod tests {
             f04_setup("t01", &["e0", "e1", "e2", "e3", "e4"], &["c0"], &c);
         let rejected = f04_rejections(&batch, &[1, 3]);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t01", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t01", 5);
         assert_eq!(remaining, 3);
         assert_eq!(
             survivors
@@ -2990,7 +2990,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 3]);
         f04_inject(&spool, RewriteFaultStage::TempCreate);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t02", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t02", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3019,7 +3019,7 @@ mod tests {
             },
         );
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t03", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t03", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3046,7 +3046,7 @@ mod tests {
             },
         );
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t04", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t04", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3068,7 +3068,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 3]);
         f04_inject(&spool, RewriteFaultStage::TempSync);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t05", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t05", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3089,7 +3089,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 3]);
         f04_inject(&spool, RewriteFaultStage::Rename);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t06", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t06", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3114,7 +3114,7 @@ mod tests {
         // fail after the durable name has already changed.
         f04_inject(&spool, RewriteFaultStage::TempHandle);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t07", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t07", 5);
         f04_retry(&spool, &c, survivors, remaining);
         spool_one(&spool, &c, record("c1"));
 
@@ -3141,7 +3141,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 5, 7]);
         f04_inject(&spool, RewriteFaultStage::TempCreate);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t08", 6);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t08", 6);
         assert_eq!(remaining, 4);
         assert_eq!(
             survivors
@@ -3196,7 +3196,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 3]);
         f04_inject(&spool, RewriteFaultStage::Rename);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t10", 5);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t10", 5);
         f04_retry(&spool, &c, survivors, remaining);
 
         let reopened = Spool::open(&cfg.spool_path, cfg.spool_max_bytes).unwrap();
@@ -3215,14 +3215,16 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1, 3]);
 
         f04_inject(&spool, RewriteFaultStage::TempSync);
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t11-fail", 5);
+        let (survivors, remaining) =
+            isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t11-fail", 5);
         assert_eq!(remaining, 2);
         f04_retry(&spool, &c, survivors, remaining);
         assert_eq!(c.spool_rewrite_failures.load(Ordering::Relaxed), 1);
 
         f04_clear(&spool);
         // c0 is now the sixth durable record, so all six are spooled on retry.
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t11-retry", 6);
+        let (survivors, remaining) =
+            isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t11-retry", 6);
         assert_eq!(remaining, 4);
         f04_retry(&spool, &c, survivors, remaining);
 
@@ -3243,7 +3245,7 @@ mod tests {
         let rejected = f04_rejections(&batch, &[1]);
         f04_inject(&spool, RewriteFaultStage::TempCreate);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t12", 4);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t12", 4);
         f04_retry(&spool, &c, survivors, remaining);
 
         assert_eq!(f04_queue_ids(&spool), vec!["e0", "e1", "e2", "e3", "c0"]);
@@ -3265,7 +3267,7 @@ mod tests {
         // is named, so neither channel-only finding can be consumed by a skip.
         f04_inject(&spool, RewriteFaultStage::TempCreate);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t13", 0);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t13", 0);
         assert_eq!(remaining, 0);
         assert_eq!(
             survivors
@@ -3297,7 +3299,7 @@ mod tests {
         // Index 2 is deliberately duplicated: accounting must be set-based.
         let rejected = f04_rejections(&batch, &[0, 2, 2, 5, 8]);
 
-        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t14", 8);
+        let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t14", 8);
         assert_eq!(remaining, 5);
         assert_eq!(
             survivors
@@ -3346,7 +3348,8 @@ mod tests {
             let rejected = f04_rejections(&batch, &[1, 3]);
             f04_inject(&spool, stage);
 
-            let (survivors, remaining) = isolate_batch(&cfg, &c, &spool, &rejected, "t15", 5);
+            let (survivors, remaining) =
+                isolate_batch(&cfg, &c, &spool, &batch, &rejected, "t15", 5);
             f04_retry(&spool, &c, survivors, remaining);
 
             let expected = vec!["e0", "e1", "e2", "e3", "e4", "c0"];
