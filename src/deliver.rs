@@ -150,6 +150,9 @@ pub struct DeliveryStats {
     pub permanent: u64,
     pub isolated: u64,
     pub quarantined: u64,
+    /// Rewrite attempts rolled back before publication. Explicit spool-integrity
+    /// events, not losses: reported so health output can never imply silence.
+    pub spool_rewrite_failures: u64,
     pub spooled: u64,
     pub dropped: u64,
     pub queue_depth: u64,
@@ -227,7 +230,8 @@ impl DeliveryStats {
     pub fn summary(&self) -> String {
         format!(
             "{} produced, {} delivered ({} replayed from disk), {} attempt(s) failed transiently, \
-             {} refused permanently, {} batch(es) isolated ({} dead-lettered at 0600), {} spooled, \
+             {} refused permanently, {} batch(es) isolated ({} dead-lettered at 0600), \
+              {} spool rewrite failure(s) rolled back (nothing lost), {} spooled, \
              {} LOST, {} in memory, {} waiting on disk ({} bytes)",
             self.produced,
             self.delivered,
@@ -236,6 +240,7 @@ impl DeliveryStats {
             self.permanent,
             self.isolated,
             self.quarantined,
+            self.spool_rewrite_failures,
             self.spooled,
             self.dropped,
             self.queue_depth,
@@ -779,30 +784,62 @@ fn quarantine_records(cfg: &Bridge, rejected: &[RejectedRecord], c: &Counters) -
             return 0;
         }
     };
+    // A failed spool rewrite keeps the named rows in the spool, so the same
+    // event IDs can be named again on the next retry. The dead-letter file is
+    // the set of findings awaiting replay, not a log of how many attempts
+    // failed: persist the first row per event ID only. An ID is marked seen
+    // ONLY after a successful write; a full file or an I/O error leaves it
+    // eligible for the next attempt, so dedupe can never turn into silent loss.
+    let mut seen: std::collections::HashSet<String> = std::fs::read(&path)
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|v| {
+                    v.get("event_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let now = now_secs();
     let mut written = 0;
+    let mut duplicate = 0;
     for rec in rejected {
+        if !seen.insert(rec.event_id.clone()) {
+            duplicate += 1;
+            continue;
+        }
         match q.write(rec, now) {
             Ok(true) => written += 1,
-            Ok(false) => log::error!(
-                "bridge: dead-letter file {} reached its {} byte cap; finding {} is LOST",
-                q.path.display(),
-                QUARANTINE_MAX_BYTES,
-                rec.event_id
-            ),
-            Err(e) => log::error!(
-                "bridge: writing finding {} to dead-letter {} failed ({e}); it is LOST",
-                rec.event_id,
-                q.path.display()
-            ),
+            Ok(false) => {
+                seen.remove(&rec.event_id);
+                log::error!(
+                    "bridge: dead-letter file {} reached its {} byte cap; finding {} is LOST",
+                    q.path.display(),
+                    QUARANTINE_MAX_BYTES,
+                    rec.event_id
+                );
+            }
+            Err(e) => {
+                seen.remove(&rec.event_id);
+                log::error!(
+                    "bridge: writing finding {} to dead-letter {} failed ({e}); it is LOST",
+                    rec.event_id,
+                    q.path.display()
+                );
+            }
         }
     }
-    let lost = rejected.len() - written;
+    let lost = rejected.len() - written - duplicate;
     c.quarantined.fetch_add(written as u64, Ordering::Relaxed);
     if lost > 0 {
         c.dropped.fetch_add(lost as u64, Ordering::Relaxed);
     }
-    written
+    // Duplicates are already in the dead-letter file, so they are accounted
+    // for (not lost) but must not inflate `quarantined` a second time.
+    written + duplicate
 }
 
 /// Operator replay, after the Sentinel contract has been fixed. Reads each
@@ -1049,6 +1086,7 @@ impl Deliverer {
             permanent: self.counters.permanent.load(Ordering::Relaxed),
             isolated: self.counters.isolated.load(Ordering::Relaxed),
             quarantined: self.counters.quarantined.load(Ordering::Relaxed),
+            spool_rewrite_failures: self.counters.spool_rewrite_failures.load(Ordering::Relaxed),
             spooled: self.counters.spooled.load(Ordering::Relaxed),
             dropped: self.counters.dropped.load(Ordering::Relaxed),
             queue_depth: q.saturating_sub(t),
@@ -2586,6 +2624,7 @@ mod tests {
             permanent: 0,
             isolated: 0,
             quarantined: 0,
+            spool_rewrite_failures: 0,
             spooled: 2,
             dropped: 0,
             queue_depth: 0,
@@ -2632,6 +2671,37 @@ mod tests {
         // tick would keep the alarm at Critical forever.
         let still_lost = DeliveryStats { dropped: 3, ..base };
         assert!(still_lost.self_finding(&lost).is_none());
+    }
+
+    #[test]
+    fn spool_rewrite_failures_are_visible_in_health_summary_without_minting_a_finding() {
+        let base = DeliveryStats {
+            produced: 10,
+            delivered: 8,
+            replayed: 0,
+            transient: 1,
+            permanent: 0,
+            isolated: 1,
+            quarantined: 1,
+            spool_rewrite_failures: 3,
+            spooled: 2,
+            dropped: 0,
+            queue_depth: 0,
+            pending_on_disk: 2,
+            spool_bytes: 1200,
+        };
+        let line = base.summary();
+        assert!(
+            line.contains("3 spool rewrite failure(s) rolled back (nothing lost)"),
+            "health summary must state the rewrite failures: {line}"
+        );
+        // A rollback is not a loss. It must not mint a Critical self-finding
+        // just because the counter changed; the explicit error log is the signal.
+        let prev = DeliveryStats {
+            spool_rewrite_failures: 0,
+            ..base
+        };
+        assert!(base.self_finding(&prev).is_none());
     }
 
     #[test]
