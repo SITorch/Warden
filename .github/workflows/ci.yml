@@ -159,9 +159,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # Gitleaks uses the GitHub API to enumerate PR commits on pull_request
-      # events. Read-only PR metadata is sufficient; no write scope is needed.
-      pull-requests: read
     steps:
       - name: Checkout full history for scanning
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -169,10 +166,81 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+      - name: Download and verify pinned Gitleaks 8.24.3
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/gitleaks-8.24.3"
+          mkdir -p "$install_dir"
+          archive="$install_dir/gitleaks_8.24.3_linux_x64.tar.gz"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          printf '%s  %s\n' \
+            '9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c' \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$install_dir" gitleaks
+          chmod 0755 "$install_dir/gitleaks"
+          "$install_dir/gitleaks" version
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Gitleaks range and scan regressions
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks-8.24.3/gitleaks
+        run: |
+          set -euo pipefail
+          bash .github/scripts/test_gitleaks_range.sh
+          bash .github/scripts/test_gitleaks_coverage.sh
+
+      - name: Derive and verify explicit scan range
+        id: scan-range
+        env:
+          GITLEAKS_EVENT: ${{ github.event_name }}
+          GITLEAKS_BEFORE: ${{ github.event.before }}
+          GITLEAKS_AFTER: ${{ github.event.after }}
+          GITLEAKS_DELETED: ${{ github.event.deleted }}
+          GITLEAKS_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          GITLEAKS_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/gitleaks_range.sh >> "$GITHUB_OUTPUT"
+
+      - name: Record expected commit identities
+        if: steps.scan-range.outputs.mode != 'skip'
+        env:
+          GITLEAKS_RANGE: ${{ steps.scan-range.outputs.range }}
+          GITLEAKS_EXPECTED_COMMITS: ${{ steps.scan-range.outputs.commits }}
+          GITLEAKS_REASON: ${{ steps.scan-range.outputs.reason }}
+          GITLEAKS_FORCE_PUSH: ${{ steps.scan-range.outputs.force_push }}
+        run: |
+          set -euo pipefail
+          git rev-list --full-history "$GITLEAKS_RANGE" > "$RUNNER_TEMP/gitleaks-expected-commits.txt"
+          echo "reason=$GITLEAKS_REASON force_push=$GITLEAKS_FORCE_PUSH expected=$GITLEAKS_EXPECTED_COMMITS"
+          echo "expected_first=$(head -n 1 "$RUNNER_TEMP/gitleaks-expected-commits.txt")"
+          echo "expected_last=$(tail -n 1 "$RUNNER_TEMP/gitleaks-expected-commits.txt")"
+
+      - name: Explicit skip (empty range or deleted ref)
+        if: steps.scan-range.outputs.mode == 'skip'
+        env:
+          GITLEAKS_REASON: ${{ steps.scan-range.outputs.reason }}
+        run: |
+          echo "gitleaks: skip reason=$GITLEAKS_REASON; no scan performed"
+
+      - name: Gitleaks detect over verified explicit range
+        if: steps.scan-range.outputs.mode != 'skip'
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks-8.24.3/gitleaks
+          GITLEAKS_LOG_OPTS: ${{ steps.scan-range.outputs.log_opts }}
+          GITLEAKS_EXPECTED_COMMITS: ${{ steps.scan-range.outputs.commits }}
+          GITLEAKS_REPORT_PATH: results.sarif
+          GITLEAKS_STDERR_LOG: ${{ runner.temp }}/gitleaks-scan.log
+        run: bash .github/scripts/gitleaks_scan.sh
+
+      - name: Upload redacted Gitleaks SARIF
+        if: ${{ always() && steps.scan-range.outputs.mode != 'skip' && hashFiles('results.sarif') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gitleaks-results.sarif
+          path: results.sarif
+          if-no-files-found: error
+          retention-days: 7
 
   docs:
     name: Documentation link check
