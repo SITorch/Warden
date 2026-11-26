@@ -14,7 +14,7 @@ license = "GPL-2.0-only"
 # host's runtime libssl.so/libcrypto.so and is NOT fully static. TLS is otherwise
 # terminated at the deployment edge (reverse proxy/tunnel), as elsewhere here.
 [dependencies]
-aya = "0.13"
+aya = "0.16"
 anyhow = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
