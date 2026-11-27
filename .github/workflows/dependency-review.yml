@@ -3,9 +3,10 @@ name: Dependency Review
 # Official Dependency Review Action on pull requests. It reads manifest diffs
 # through the GitHub API and does not check out or execute pull-request code.
 # No pull_request_target, secrets, or write permissions are used.
-# On a private repository the result is DEFERRED_PRIVATE_REPOSITORY, not PASS,
-# and this workflow is not a required check until it succeeds on a supported
-# configuration.
+# On a private or internal repository the result is an explicit deferral, not
+# PASS, and this workflow is not a required check until it succeeds on a
+# supported configuration. Metadata retrieval failures fail the job rather
+# than being misread as a private-repository deferral.
 
 on:
   pull_request:
@@ -34,16 +35,39 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          visibility="$(gh api "repos/${REPOSITORY}" --jq '.visibility')"
-          echo "repository visibility: ${visibility}"
-          if [ "$visibility" != "PUBLIC" ]; then
-            echo "supported=false" >> "$GITHUB_OUTPUT"
-            echo "DEPENDENCY_REVIEW_STATUS=DEFERRED_PRIVATE_REPOSITORY"
-            echo "::notice::Dependency Review=DEFERRED_PRIVATE_REPOSITORY; enable and verify it on a supported public configuration before making it required. This is not a PASS."
-          else
-            echo "supported=true" >> "$GITHUB_OUTPUT"
-            echo "DEPENDENCY_REVIEW_STATUS=ELIGIBLE; review will run in the next job."
+          if ! visibility_raw="$(gh api "repos/${REPOSITORY}" --jq '.visibility')"; then
+            echo "DEPENDENCY_REVIEW_STATUS=METADATA_FETCH_FAILED" >&2
+            echo "::error::Unable to retrieve repository visibility; refusing to defer as private."
+            exit 1
           fi
+          if [ -z "$visibility_raw" ]; then
+            echo "DEPENDENCY_REVIEW_STATUS=METADATA_MISSING" >&2
+            echo "::error::Repository visibility is empty; refusing to defer as private."
+            exit 1
+          fi
+          visibility="$(printf '%s' "$visibility_raw" | tr '[:upper:]' '[:lower:]')"
+          echo "repository visibility: ${visibility} (raw: ${visibility_raw})"
+          case "$visibility" in
+            public)
+              echo "supported=true" >> "$GITHUB_OUTPUT"
+              echo "DEPENDENCY_REVIEW_STATUS=ELIGIBLE; review will run in the next job."
+              ;;
+            private)
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+              echo "DEPENDENCY_REVIEW_STATUS=DEFERRED_PRIVATE_REPOSITORY"
+              echo "::notice::Dependency Review=DEFERRED_PRIVATE_REPOSITORY; enable and verify it on a supported public configuration before making it required. This is not a PASS."
+              ;;
+            internal)
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+              echo "DEPENDENCY_REVIEW_STATUS=DEFERRED_INTERNAL_REPOSITORY"
+              echo "::notice::Dependency Review=DEFERRED_INTERNAL_REPOSITORY; entitlement must be verified before review. This is not a PASS."
+              ;;
+            *)
+              echo "DEPENDENCY_REVIEW_STATUS=UNKNOWN_VISIBILITY" >&2
+              echo "::error::Unexpected repository visibility '${visibility_raw}'; refusing to defer."
+              exit 1
+              ;;
+          esac
 
   review:
     name: Review dependency changes
