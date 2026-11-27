@@ -1,0 +1,66 @@
+name: Dependency Review
+
+# Official Dependency Review Action on pull requests. It reads manifest diffs
+# through the GitHub API and does not check out or execute pull-request code.
+# No pull_request_target, secrets, or write permissions are used.
+# On a private repository the result is DEFERRED_PRIVATE_REPOSITORY, not PASS,
+# and this workflow is not a required check until it succeeds on a supported
+# configuration.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  entitlement:
+    name: Check dependency review entitlement
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      supported: ${{ steps.gate.outputs.supported }}
+    steps:
+      - name: Determine private-plan availability
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          visibility="$(gh api "repos/${REPOSITORY}" --jq '.visibility')"
+          echo "repository visibility: ${visibility}"
+          if [ "$visibility" != "PUBLIC" ]; then
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+            echo "DEPENDENCY_REVIEW_STATUS=DEFERRED_PRIVATE_REPOSITORY"
+            echo "::notice::Dependency Review=DEFERRED_PRIVATE_REPOSITORY; enable and verify it on a supported public configuration before making it required. This is not a PASS."
+          else
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+            echo "DEPENDENCY_REVIEW_STATUS=ELIGIBLE; review will run in the next job."
+          fi
+
+  review:
+    name: Review dependency changes
+    needs: entitlement
+    if: needs.entitlement.outputs.supported == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Run official Dependency Review Action
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
+
+      - name: Dependency Review result
+        if: always()
+        run: |
+          echo "Dependency Review action finished; consult its annotations above for any newly introduced vulnerable dependency."
+          echo "No untrusted pull-request code was checked out or executed by this workflow."

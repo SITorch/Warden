@@ -21,7 +21,6 @@ DOC_DIR=""
 BINARY=""
 CONFIG_SOURCE=""
 UNIT_SOURCE=""
-DOCTOR_SOURCE=""
 YES=0
 UNATTENDED=0
 REPLACE_CONFIG=0
@@ -141,6 +140,8 @@ TARGET_UNIT="$UNIT_DIR/warden.service"
 TARGET_DOC="$DOC_DIR/README.md"
 
 # ── 1-10: environment assessment (read-only) ───────────────────────────────
+# /etc/os-release is a host file, not a script input (SC1091 is not applicable).
+# shellcheck disable=SC1091
 OS_NAME="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" || echo unknown)"
 ARCH="$(uname -m)"
 KERNEL="$(uname -r)"

@@ -11,7 +11,6 @@ BIN="${GITLEAKS_BIN:-gitleaks}"
 ZERO="0000000000000000000000000000000000000000"
 WORK="$(mktemp -d /tmp/warden-gitleaks-coverage.XXXXXXXX)"
 EVIDENCE="${GITLEAKS_TEST_EVIDENCE_DIR:-$WORK/evidence}"
-CURRENT_LOG=""
 
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT

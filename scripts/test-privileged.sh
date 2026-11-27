@@ -15,7 +15,6 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
-BIN_DIR="$(pwd)"
 
 skip() {
   printf 'SKIP: %s\n' "$1"

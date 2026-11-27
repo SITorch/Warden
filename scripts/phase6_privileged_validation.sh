@@ -142,7 +142,7 @@ wait_for_log() { # file pattern seconds
 
 start_agent() { # config tag
     local cfg="$1" tag="$2"
-    "$BIN" --debug --config "$WORK/$tag.toml" >"$WORK/$tag.log" 2>&1 &
+    "$BIN" --debug --config "$WORK/$cfg.toml" >"$WORK/$tag.log" 2>&1 &
     AGENT_PID=$!
     sleep 1
     kill -0 "$AGENT_PID" 2>/dev/null

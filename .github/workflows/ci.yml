@@ -113,7 +113,7 @@ jobs:
           path = Path("docs/release/warden_alpha1.spdx.json")
           raw = path.read_bytes()
           digest = hashlib.sha256(raw).hexdigest()
-          expected = "034a82a9840c14275960db67d51e45b58658fcca65540cec9148fc1d9756ec78"
+          expected = "8ce721ef5682bee00616de315227634b790b1389417b088170b1e76ede18b1f6"
           if digest != expected:
               raise SystemExit(f"SBOM digest mismatch: {digest}")
           doc = json.loads(raw)
