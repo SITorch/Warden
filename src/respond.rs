@@ -549,6 +549,105 @@ mod tests {
         }
     }
 
+    /// F09 acceptance: a process that copies a protected `comm` is visible to
+    /// the tripwire but never reaches `Action::Refused`. This exercises the real
+    /// responder decision path and asserts the resulting SIGKILL wait status.
+    #[test]
+    fn f09_comm_only_selector_cannot_grant_sigkill_immunity() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+
+        let spoof_comm = "f09spoof";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '{spoof_comm}' > /proc/self/comm; sleep 30"))
+            .spawn()
+            .expect("spawn a sacrificial shell that renames itself");
+        let pid = child.id();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap_or_default()
+                .trim_end()
+                .to_string();
+            if current == spoof_comm {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child comm was never set");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let cfg = crate::config::Protect {
+            comms: vec![spoof_comm.into()],
+            cgroup_contains: Vec::new(),
+            protect_self: false,
+            targets: Vec::new(),
+        };
+        let resolution = crate::procscan::resolve_protected(&cfg);
+        assert!(
+            resolution.protected.is_empty(),
+            "a mutable comm must not create immunity"
+        );
+        assert!(resolution.tripwire.pids().contains(&pid));
+
+        let r = Responder::new(Mode::Enforce, true);
+        let recorded = starttime_of(pid).expect("child start time is readable");
+        let mut f = finding_with_starttime(pid, true, Some(recorded));
+        f.process.comm = spoof_comm.into();
+
+        assert_eq!(
+            r.act(&f, &resolution.protected),
+            Action::Killed,
+            "the original F09 decision path must no longer return Refused"
+        );
+        let status = child.wait().expect("wait for the killed child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the spoofed comm must not prevent the real SIGKILL"
+        );
+    }
+
+    /// F09 compatibility: an anchored target keeps the documented protection.
+    #[test]
+    fn f09_anchored_target_still_refuses_sigkill() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a sacrificial `sleep 30`");
+        let pid = child.id();
+        let recorded = starttime_of(pid).expect("child start time is readable");
+        let exe = crate::events::exe_of(pid).expect("child executable is readable");
+        let uid = unsafe { libc::getuid() };
+
+        let cfg = crate::config::Protect {
+            comms: Vec::new(),
+            cgroup_contains: Vec::new(),
+            protect_self: false,
+            targets: vec![crate::config::ProtectTarget {
+                comm: Some("sleep".into()),
+                exe: Some(exe),
+                uid: Some(uid),
+                cgroup: None,
+            }],
+        };
+        let resolution = crate::procscan::resolve_protected(&cfg);
+        assert!(
+            resolution.protected.pids().contains(&pid),
+            "an anchored identity target must still grant immunity"
+        );
+
+        let r = Responder::new(Mode::Enforce, true);
+        let mut f = finding_with_starttime(pid, true, Some(recorded));
+        f.process.comm = "sleep".into();
+        assert_eq!(r.act(&f, &resolution.protected), Action::Refused);
+
+        // Clean up the protected child without going through the responder.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
+    }
+
     #[test]
     fn observe_mode_never_kills() {
         let r = Responder::new(Mode::Observe, true);

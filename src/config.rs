@@ -291,11 +291,12 @@ pub fn page_size() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Protect {
-    /// Match protected processes by exact comm (e.g. "granian", "celery").
+    /// Select processes for the signal/ptrace tripwire by exact comm
+    /// (e.g. "granian", "celery").
     ///
     /// Spoofable by construction: comm is 15 bytes any process can set on
-    /// itself with `prctl(PR_SET_NAME)`. Kept because it is what existing
-    /// deployments use; `targets` below is the strong alternative.
+    /// itself with `prctl(PR_SET_NAME)`. F09: this field is **tripwire only**;
+    /// it never grants kill immunity. Use `targets` below for immunity.
     #[serde(default)]
     pub comms: Vec<String>,
     /// Match protected processes by systemd unit substring in their cgroup path.
@@ -307,12 +308,13 @@ pub struct Protect {
     /// Always protect Warden's own pid (default true; you want this).
     #[serde(default = "default_true")]
     pub protect_self: bool,
-    /// Protected processes matched by identity rather than by name (W-R4).
+    /// Processes granted kill immunity by stable identity rather than by name
+    /// (W-R4 / F09).
     ///
-    /// Each entry is an AND over the fields it names, and is ORed with the
-    /// legacy selectors above — so adding one never takes protection away from
-    /// a process `comms`/`cgroup_contains` already covered. Empty by default,
-    /// which leaves an existing `warden.toml` behaving exactly as before.
+    /// Each entry is an AND over the fields it names. Only entries that name
+    /// `exe`, real `uid`, or exact `cgroup` grant immunity; a comm-only entry is
+    /// tripwire-only. `comms` remains tripwire-only and `cgroup_contains`
+    /// retains its pre-existing behavior. Empty by default.
     #[serde(default)]
     pub targets: Vec<ProtectTarget>,
 }
@@ -366,9 +368,9 @@ pub struct ProtectTarget {
 
 impl ProtectTarget {
     /// Whether this target constrains anything a process cannot simply name
-    /// itself. False means it is a name-only selector — the thing W-R4 is
-    /// about — and also that it can never match, since a target that names no
-    /// field is treated as matching nothing.
+    /// itself. False means it is a name-only selector: it may feed the F09
+    /// tripwire, but it can never grant kill immunity. A target that names no
+    /// field matches nothing at all.
     pub fn names_identity(&self) -> bool {
         self.exe.is_some() || self.uid.is_some() || self.cgroup.is_some()
     }
@@ -396,32 +398,49 @@ impl ProtectTarget {
     }
 }
 
+/// Why a `[protect]` selector was called out in the startup log. Keeping this
+/// typed avoids classifying operators' cgroup names by searching message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectSelectorClass {
+    /// `comms` or a comm-only target: F09 keeps the alert but never grants
+    /// kill immunity.
+    TripwireOnly,
+    /// `cgroup_contains`: loose, but F09 deliberately leaves it immunizing.
+    LooseImmunity,
+    /// A blank needle that is ignored rather than applied.
+    Ignored,
+}
+
 impl Protect {
-    /// The parts of this policy that identify a process by something it can set
-    /// for itself, or by a loose substring — everything except a target that
-    /// names `exe`, `uid` or an exact `cgroup`.
-    ///
-    /// Exists so the startup log can say what the policy actually rests on. A
-    /// bare "protecting 3 pid(s)" reads like a guarantee, and for a comm-only
-    /// policy it is not one.
-    pub fn weak_selectors(&self) -> Vec<String> {
+    /// Operator-facing notices for weak selectors, paired with their class.
+    pub fn selector_notices(&self) -> Vec<(ProtectSelectorClass, String)> {
         let mut out = Vec::new();
         for c in &self.comms {
-            out.push(format!(
-                "comms: {c:?} matches a comm any process can set with prctl(PR_SET_NAME)"
+            out.push((
+                ProtectSelectorClass::TripwireOnly,
+                format!("comms: {c:?} is a comm any process can set with prctl(PR_SET_NAME)"),
             ));
         }
         for n in &self.cgroup_contains {
             if n.trim().is_empty() {
-                out.push("cgroup_contains: a blank needle is ignored".to_string());
+                out.push((
+                    ProtectSelectorClass::Ignored,
+                    "cgroup_contains: a blank needle is ignored".to_string(),
+                ));
             } else {
-                out.push(format!("cgroup_contains: {n:?} is a substring match"));
+                // F09 does not change this selector; it remains an immunizing
+                // but loose match, so do not call it "tripwire only".
+                out.push((
+                    ProtectSelectorClass::LooseImmunity,
+                    format!("cgroup_contains: {n:?} is a substring match"),
+                ));
             }
         }
         for (i, t) in self.targets.iter().enumerate() {
             if !t.names_identity() {
-                out.push(format!(
-                    "targets[{i}]: names only comm, so it is no stronger than `comms`"
+                out.push((
+                    ProtectSelectorClass::TripwireOnly,
+                    format!("targets[{i}]: names only comm, so it is no stronger than `comms`"),
                 ));
             }
         }
@@ -2798,7 +2817,29 @@ mod tests {
         assert!(t.names_identity());
         // The second names only comm: a name-only selector, reported as weak.
         assert!(!cfg.protect.targets[1].names_identity());
-        assert_eq!(cfg.protect.weak_selectors().len(), 2);
+        assert_eq!(cfg.protect.selector_notices().len(), 2);
+    }
+
+    #[test]
+    fn protect_selector_notices_are_typed_not_message_sniffed() {
+        let cfg: Config = toml::from_str(
+            "[protect]\ncomms = [\"granian\"]\ncgroup_contains = [\"ignored.service\", \"\"]\n\n\
+             [[protect.targets]]\ncomm = \"celery\"\n",
+        )
+        .unwrap();
+
+        let notices = cfg.protect.selector_notices();
+        let classes: Vec<_> = notices.into_iter().map(|(class, _)| class).collect();
+        assert_eq!(
+            classes,
+            vec![
+                ProtectSelectorClass::TripwireOnly,
+                ProtectSelectorClass::LooseImmunity,
+                ProtectSelectorClass::Ignored,
+                ProtectSelectorClass::TripwireOnly,
+            ],
+            "a cgroup needle containing the word 'ignored' must still be classed as immunizing"
+        );
     }
 
     #[test]

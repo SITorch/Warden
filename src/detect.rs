@@ -583,9 +583,12 @@ impl Detector {
         }
     }
 
-    /// W2K-10: hand the judges the protected set that was pushed to the kernel.
-    /// Called by `src/main.rs` at startup, on every reconciliation tick, and on
-    /// SIGHUP reload — the same three places that write the kernel's pid map.
+    /// W2K-10 / F09: hand the judges the identity table behind the pid set that
+    /// was pushed to the kernel. This includes tripwire-only pids (comm matches)
+    /// so PID reuse can still be proven for them; it is NOT the responder's
+    /// immunity set and is never passed to `Responder::act`. Called by
+    /// `src/main.rs` at startup, on every reconciliation tick, and on SIGHUP
+    /// reload — the same three places that write the kernel's pid map.
     pub fn set_protected(&mut self, protected: Protected) {
         *self.protected.borrow_mut() = protected;
     }
