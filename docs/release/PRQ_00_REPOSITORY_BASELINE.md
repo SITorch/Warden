@@ -119,6 +119,8 @@ disposable isolated VM with recovery.
 
 - **Redact in place for public docs:** `SECURITY.md`, `DESIGN.md`, `README.md`,
   `docs/security/WARDEN_MISSION_16_OPERATOR_GUIDE.md`, `scripts/LIVE_VALIDATION.md`.
+- **Current public replacements:** `docs/release/WARDEN_FINAL_OPERATOR_HANDOFF.md` and
+  `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` replace the excluded operator guide and raw runbook.
 - **Never publish raw:** `evidence/m15/`, `evidence/m16/`, `evidence/prq/` raw scans,
   `scratch/`, both ZIPs, `target/`, `.pyc`, local paths/IPs/usernames, and any parent
   SENTINEL source. Public evidence will be sanitized summaries only.

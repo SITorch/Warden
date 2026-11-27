@@ -115,7 +115,7 @@ structural/focused test in this tree, **not** a privileged live attack test.
   `src/telemetry.rs`, with `UNKNOWN` instead of zero where a reading is absent.
 - **Evidence status:** the structural claims above are checked by the tests in
   `Warden/tests/`; privileged attach/enforce outcomes require the isolated VM
-  procedure in `scripts/LIVE_VALIDATION.md` and are not claimed here.
+  procedure in `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` and are not claimed here.
 
 ## 6. Mission 16 configuration/install boundary
 

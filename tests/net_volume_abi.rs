@@ -26,7 +26,7 @@
 //! None of this needs privileges: it parses the embedded ELF and its BTF, and reads
 //! the two source files the object must not drift from. What it cannot prove is the
 //! empirical half — that a program LOADS on a given kernel and that a bump lands in
-//! the right cgroup. §22 of `scripts/LIVE_VALIDATION.md` collected that for the
+//! the right cgroup. §22 of `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` collected that for the
 //! three stream/datagram-egress hooks on the deployment kernel, and §23 collected it
 //! for the fourth, `fexit/udp_recvmsg`: all four attached on `6.12.107+deb13-amd64`
 //! and a known IPv4 datagram transfer landed as `out 102400B/100 ops, in

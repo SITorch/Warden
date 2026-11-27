@@ -837,7 +837,7 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
     // in-flight dial has no outcome yet, so the kernel emits a record only for a
     // terminal return. Most egress therefore has a where without a what-happened, and
     // the periodic `ringbuf: clean` line prints the verdict/dial ratio so the gap is
-    // declared rather than papered over. See EVALUATION-AND-FIXES.md §42 for the probe
+    // declared rather than papered over. See docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md §42 for the probe
     // and its tables.
     loaded.set_connect_result_emit(true)?;
     // The INBOUND half of the flow picture (N-03 accept, N-04, N-12): who accepted

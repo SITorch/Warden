@@ -20,7 +20,7 @@
 //! deployment host, `/sys/kernel/tracing/available_filter_functions` is mode 0440
 //! root:root, and reading its `Permission denied` as "the function is not there"
 //! would have reported four working hooks as missing (§23 of
-//! `scripts/LIVE_VALIDATION.md`, step 1). Wherever this module cannot see, it says
+//! `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md`, step 1). Wherever this module cannot see, it says
 //! it cannot see.
 //!
 //! WHAT THE ANSWER STILL DOES NOT MEAN. Symbol presence is the weakest of the
@@ -658,7 +658,7 @@ pub fn report() -> Vec<String> {
          map and started nothing. Three levels decide whether a sensor exists — clang accepts \
          the C, the verifier accepts the bytecode and its BTF relocations, and attach plus a \
          bump in the right row — and only the last is a measurement. The live record for the \
-         deployment kernel is §22/§23 of scripts/LIVE_VALIDATION.md; the policy lines above \
+         deployment kernel is §22/§23 of docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md; the policy lines above \
          came from the config file and these came from the kernel, and neither is a statement \
          about a Warden that is currently running."
             .to_string(),

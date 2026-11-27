@@ -48,10 +48,18 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers through the same private reporting channel
-documented in `SECURITY.md`. All complaints will be reviewed and investigated
-promptly and fairly. Maintainers are obligated to respect the privacy and
-security of the reporter of any incident.
+reported to the project maintainers. Conduct reports are **not** security
+vulnerability reports: do **not** use the private vulnerability reporting
+channel documented in `SECURITY.md`, because that channel is scoped to
+security findings and its triage path is different.
+
+To request a private conduct-reporting contact, open a non-security GitHub
+Issue titled `Code of Conduct contact request` and include **no incident
+details**. A maintainer will respond through an already-established private
+channel. If no such channel exists, do not disclose sensitive details in a
+public issue. All complaints will be reviewed and investigated promptly and
+fairly. Maintainers are obligated to respect the privacy and security of the
+reporter of any incident.
 
 ## Enforcement Guidelines
 

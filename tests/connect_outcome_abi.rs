@@ -19,7 +19,7 @@
 //!
 //! The second thing pinned here is the part that was MEASURED, not designed, on the
 //! deployment kernel (`6.12.107+deb13-amd64`) with a throwaway kretprobe — see
-//! `EVALUATION-AND-FIXES.md` §42 for the tables. Two results changed the shape of
+//! `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §42 for the tables. Two results changed the shape of
 //! the code:
 //!   - the kretprobe's `retval` is a 32-bit return widened into the 64-bit register,
 //!     so without a truncation-and-sign-extend every failure decodes as "no claim"

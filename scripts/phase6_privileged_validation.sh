@@ -13,7 +13,7 @@
 # The script prints one line per test:
 #   CLASSIFICATION: <EXECUTED AND PASSED|EXECUTED AND FAILED|SKIPPED|BLOCKED BY ENVIRONMENT> | name | detail
 # followed by a final SUMMARY. The caller must copy those lines verbatim into
-# docs/security/warden_phase6_live_validation.md; a green script is not a pass
+# docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md; a green script is not a pass
 # unless the individual classifications say so.
 set -u
 

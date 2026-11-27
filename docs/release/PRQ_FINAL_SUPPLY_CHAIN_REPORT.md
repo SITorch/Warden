@@ -8,7 +8,7 @@ Prepared 2026-11-24.
 
 | Item | Value |
 |---|---|
-| `Cargo.toml` | package `warden` 0.1.0, edition 2021, license GPL-2.0 |
+| `Cargo.toml` | package `warden` 0.1.0, edition 2021, license GPL-2.0-only |
 | `Cargo.lock` | 72 packages; 71 with registry checksums; 1 local package |
 | `Cargo.lock` SHA-256 | `509d60d0d324a152ea174ed68da2bf79dca2dd8716266bc46d8d692946f51a8f` |
 | SPDX SBOM | `docs/release/warden_alpha1.spdx.json`, SPDX 2.3, 79 packages, 78 relationships |

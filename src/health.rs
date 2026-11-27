@@ -68,7 +68,7 @@ const HEARTBEAT_THREAD: &str = "warden-heartbeat";
 const UNIT_CGROUP_NEEDLE: &str = "warden.service";
 /// The modes that print and return: a same-named process running one of these is
 /// a *command*, not the agent, and must never be mistaken for it. This is
-/// `scripts/LIVE_VALIDATION.md` §24 step 6's `pgrep` trap solved structurally
+/// `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §24 step 6's `pgrep` trap solved structurally
 /// instead of by luck.
 const PRINT_AND_RETURN: &[&str] = &[
     "--check",
