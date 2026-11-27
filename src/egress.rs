@@ -292,7 +292,8 @@ impl EgressProtocol {
 /// One operator-authored deny rule. `port = 0` is the only wildcard the kernel
 /// understands: "any port for this address+protocol". There is no hostname,
 /// CIDR, or process-name wildcard — a deny must name an address an operator can
-/// read and audit.
+/// read and audit. An IPv4-mapped IPv6 literal names the same endpoint as the
+/// equivalent dotted IPv4 literal and compiles to the same canonical key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressDeny {
     pub address: String,
@@ -316,10 +317,19 @@ impl EgressDeny {
                 full[..4].copy_from_slice(&v4.octets());
                 2u32 // AF_INET
             }
-            IpAddr::V6(v6) => {
-                full[..16].copy_from_slice(&v6.octets());
-                10u32 // AF_INET6
-            }
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                // F06: `::ffff:a.b.c.d` is the same logical endpoint as `a.b.c.d`.
+                // Canonicalize it here, the single policy-key boundary, so a
+                // dotted IPv4 deny and a mapped observation share one key.
+                Some(v4) => {
+                    full[..4].copy_from_slice(&v4.octets());
+                    2u32 // AF_INET
+                }
+                None => {
+                    full[..16].copy_from_slice(&v6.octets());
+                    10u32 // AF_INET6
+                }
+            },
         };
         Ok(EgressKey {
             family,
@@ -1211,6 +1221,125 @@ mod tests {
         assert_eq!(&k6.addr[..4], &[0x20, 0x01, 0x0d, 0xb8]);
         assert_eq!(k6.addr[15], 1);
         assert_eq!(k6.port, 0); // wildcard
+    }
+
+    #[test]
+    fn f06_canonical_key_contract() {
+        // Only the exact ::ffff: prefix is an IPv4 endpoint. Everything else,
+        // including loopback, unspecified, NAT64 and a late ffff word, stays
+        // AF_INET6.
+        let cases: [(&str, u32, [u8; 4]); 8] = [
+            ("192.0.2.10", 2, [192, 0, 2, 10]),
+            ("::ffff:192.0.2.10", 2, [192, 0, 2, 10]),
+            ("::ffff:c000:020a", 2, [192, 0, 2, 10]),
+            ("2001:db8::10", 10, [0x20, 0x01, 0x0d, 0xb8]),
+            ("::1", 10, [0, 0, 0, 0]),
+            ("::", 10, [0, 0, 0, 0]),
+            ("64:ff9b::c000:020a", 10, [0x00, 0x64, 0xff, 0x9b]),
+            ("2001:db8::ffff:c000:020a", 10, [0x20, 0x01, 0x0d, 0xb8]),
+        ];
+        for (text, family, prefix) in cases {
+            let key = deny(text, 443, EgressProtocol::Tcp).to_key().unwrap();
+            assert_eq!(key.family, family, "{text}");
+            assert_eq!(&key.addr[..4], &prefix, "{text}");
+            if family == 2 {
+                assert_eq!(&key.addr[4..], &[0u8; 12], "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn f06_ipv4_deny_matches_equivalent_ipv4_mapped_endpoint() {
+        // The cgroup/connect6 and cgroup/sendmsg6 hooks evaluate an IPv4-mapped
+        // destination with a mapped address; the key compiler below is the
+        // userspace half of the same ABI. An IPv4 deny must therefore produce a
+        // key that the mapped spelling also resolves to. Regression for F06.
+        let planned =
+            EgressPolicy::plan(&[deny("192.0.2.10", 443, EgressProtocol::Tcp)], 1).unwrap();
+        for endpoint in ["::ffff:192.0.2.10", "::ffff:c000:020a"] {
+            let observed = deny(endpoint, 443, EgressProtocol::Tcp).to_key().unwrap();
+            assert!(
+                planned.contains_key(&observed),
+                "IPv4-mapped endpoint key {observed:?} for {endpoint} missed the IPv4 deny policy"
+            );
+        }
+    }
+
+    #[test]
+    fn f06_plan_is_symmetric_and_does_not_broaden_denial() {
+        let ipv4 = deny("192.0.2.10", 443, EgressProtocol::Tcp);
+        let mapped = deny("::ffff:192.0.2.10", 443, EgressProtocol::Tcp);
+        let from_ipv4 = EgressPolicy::plan(&[ipv4], 1).unwrap();
+        let from_mapped = EgressPolicy::plan(&[mapped], 1).unwrap();
+        assert_eq!(from_ipv4, from_mapped);
+        assert_eq!(from_ipv4.len(), 1);
+
+        let cases = [
+            ("192.0.2.10", 443, EgressProtocol::Tcp, true),
+            ("::ffff:192.0.2.10", 443, EgressProtocol::Tcp, true),
+            ("::ffff:c000:020a", 443, EgressProtocol::Tcp, true),
+            ("192.0.2.11", 443, EgressProtocol::Tcp, false),
+            ("::ffff:192.0.2.11", 443, EgressProtocol::Tcp, false),
+            ("2001:db8::10", 443, EgressProtocol::Tcp, false),
+            ("2001:db8::ffff:c000:020a", 443, EgressProtocol::Tcp, false),
+            ("::1", 443, EgressProtocol::Tcp, false),
+            ("::", 443, EgressProtocol::Tcp, false),
+            ("192.0.2.10", 444, EgressProtocol::Tcp, false),
+            ("::ffff:192.0.2.10", 443, EgressProtocol::Udp, false),
+        ];
+        for (endpoint, port, protocol, expected) in cases {
+            let key = deny(endpoint, port, protocol).to_key().unwrap();
+            assert_eq!(
+                from_ipv4.contains_key(&key),
+                expected,
+                "{endpoint}:{port}:{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f06_wildcard_and_protocol_semantics_survive_canonicalization() {
+        let wildcard =
+            EgressPolicy::plan(&[deny("::ffff:192.0.2.10", 0, EgressProtocol::Udp)], 1).unwrap();
+        assert!(
+            wildcard.contains_key(&deny("192.0.2.10", 0, EgressProtocol::Udp).to_key().unwrap())
+        );
+        assert!(!wildcard.contains_key(
+            &deny("192.0.2.10", 53, EgressProtocol::Udp)
+                .to_key()
+                .unwrap()
+        ));
+
+        let exact_and_wildcard = EgressPolicy::plan(
+            &[
+                deny("192.0.2.10", 443, EgressProtocol::Tcp),
+                deny("::ffff:192.0.2.10", 0, EgressProtocol::Tcp),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(exact_and_wildcard.len(), 2);
+        assert!(exact_and_wildcard.contains_key(
+            &deny("192.0.2.10", 443, EgressProtocol::Tcp)
+                .to_key()
+                .unwrap()
+        ));
+        assert!(exact_and_wildcard
+            .contains_key(&deny("192.0.2.10", 0, EgressProtocol::Tcp).to_key().unwrap()));
+    }
+
+    #[test]
+    fn f06_serde_round_trip_preserves_canonical_key() {
+        let original = deny("::ffff:192.0.2.10", 443, EgressProtocol::Tcp);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: EgressDeny = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(
+            restored.to_key().unwrap(),
+            deny("192.0.2.10", 443, EgressProtocol::Tcp)
+                .to_key()
+                .unwrap()
+        );
     }
 
     #[test]
