@@ -113,7 +113,7 @@ jobs:
           path = Path("docs/release/warden_alpha1.spdx.json")
           raw = path.read_bytes()
           digest = hashlib.sha256(raw).hexdigest()
-          expected = "09dd1a06bc11ac6ac7acd995c87b9e1f251c52953f15dc9e9f3820122bdaf218"
+          expected = "034a82a9840c14275960db67d51e45b58658fcca65540cec9148fc1d9756ec78"
           if digest != expected:
               raise SystemExit(f"SBOM digest mismatch: {digest}")
           doc = json.loads(raw)
@@ -125,6 +125,11 @@ jobs:
               raise SystemExit("unexpected SBOM relationship count")
           print("SBOM verified: SPDX-2.3, 79 packages, 78 relationships")
           PY
+          python3 scripts/check_sbom_identity.py \
+            --sbom docs/release/warden_alpha1.spdx.json \
+            --lock Cargo.lock \
+            --artifact SPDXRef-bpf-object=bpf/warden.bpf.o
+          python3 -m unittest discover -s scripts/tests -p 'test_sbom_identity.py'
 
   supply-chain:
     name: Dependency audit and license policy
