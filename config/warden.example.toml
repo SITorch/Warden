@@ -53,6 +53,9 @@ open_files_max = 4096
 io_weight = 20
 
 [protect]
+# F09: comm entries are tripwire-only. They alert on signal/ptrace at a
+# matching name but cannot make the responder refuse SIGKILL. Add an anchored
+# [[protect.targets]] with exe / real uid / exact cgroup for immunity.
 comms = [
     "granian",
     "celery",

@@ -159,7 +159,7 @@ do not expect it.
 | Retracting access through an fd opened *before* arming | **Lab-proven on one kernel** for descriptors; writable mappings still not revoked | `lsm/file_permission` re-checks every read/write (including `O_APPEND`) once armed. The privileged VM runner proved `read`, `write`, `ftruncate` and `fchmod` through a pre-armed fd all returned `-EPERM`. A writable **mapping** created before arming is still not revoked — page faults bypass the hook |
 | Kill a confirmed offender | One armed takedown case `PASS` in a disposable VM; full matrix not qualified | `src/respond.rs`, opt-in per rule; signals through a `pidfd` where the kernel has one, `kill(2)` otherwise. The VM run killed the exact throwaway signalling actor via `pidfd_send_signal` and logged `action=killed`; PID reuse, exclusions, other flags and fallback remain untested. See `docs/release/PRQ_FINAL_ENFORCEMENT_PROOF.md` |
 | Kill identity check (pid reuse) | Implemented | The process start time is captured at enrichment and re-verified against a `pidfd` before anything is signalled, so a recycled pid is **refused** rather than killed (W-R3) |
-| Protected-set identity | Partial | `[[protect.targets]]` matches on `comm`/`exe`/real `uid`/exact `cgroup` (all named fields must hold), kill-immunity is bound to the pid's start time (W-R4), and the takedown/inspection judges check that same binding before reporting, so a recycled pid no longer produces a false `endpoint:self_tamper` (W2K-10). The kernel's `protected_pids` map is still keyed by pid alone — the record is still emitted for the stale number and is dropped in userspace, with a `debug` line naming why |
+| Protected-set identity | Partial | `[[protect.targets]]` with `exe`/real `uid`/exact `cgroup` grants immunity (all named fields must hold); F09 excludes `comms` and comm-only targets from immunity while keeping them in the PID-keyed tripwire. Kill-immunity is bound to the pid's start time (W-R4), and the takedown/inspection judges check that same binding before reporting, so a recycled pid no longer produces a false `endpoint:self_tamper` (W2K-10). The kernel's `protected_pids` map is still keyed by pid alone — the record is still emitted for the stale number and is dropped in userspace, with a `debug` line naming why |
 | Kill from inside the kernel | **Planned** | `bpf_send_signal` is not called. `src/config.rs` says so in as many words; `DESIGN.md` §4/§6 describe the host probe |
 | Ring-buffer drop counter | Implemented | `ringbuf_drops` + `ringbuf_events`, one slot per event kind (W2K-14), reported per sensor by `src/main.rs` |
 | Ring size and per-event `/proc` cost | Implemented, load path unverified on a non-root host | `[runtime] ring_size_kib` sizes the events ring when its map is created, so the shipped object no longer fixes the capacity; `[runtime] enrich_cache_ms` collapses the four `/proc` reads per event into one, keyed on `(pid, start time)` and always bypassed for `execve` (W2K-13). `tests/ring_size_override.rs` checks the capacity the kernel actually creates, and prints SKIPPED instead of passing when it cannot load |
@@ -578,16 +578,18 @@ semantics, backup behavior and safe VM procedures.
   `warden.toml` as a whole does not deny unknown keys — so after editing this
   section, read `warden --check`'s `events ring:` line: it echoes both the size
   policy asked for and the size this host's page granularity would build.
-- `[protect]` — which processes are guarded, by exact comm, cgroup substring, or
-  a `[[protect.targets]]` identity tuple (`comm`/`exe`/`uid`/`cgroup`; every
-  field named must match). `protect_self` keeps Warden's own pid in the set. A
-  signal or ptrace at any of these fires immediately, and the kill responder
-  refuses to target them. **comm and cgroup substrings are spoofable** — any
-  process can take a protected name with `prctl(PR_SET_NAME)` — so targets are
-  the strong selector (W-R4). Membership is bound to the process's start time,
-  so a recycled pid does not inherit protection. An omitted `[protect]` table
-  now defaults `protect_self` to `true`; before, it silently defaulted to
-  `false`.
+- `[protect]` — which processes are guarded. `protect_self` keeps Warden's own
+  pid in the immunity set, and `[[protect.targets]]` grants immunity through an
+  AND over `comm`/`exe`/`uid`/exact `cgroup` **only when the target also names
+  `exe`, real `uid`, or exact `cgroup`** (W-R4/F09). `[protect].comms` and
+  comm-only targets are **tripwire-only**: a signal or ptrace at a matching pid
+  still alerts, but the kill responder never returns `action=refused` for them.
+  This matters because any process can take a protected name with
+  `prctl(PR_SET_NAME)`; a name by itself is not an identity. `cgroup_contains`
+  retains its previous behavior and is the loosest immunizing selector, so an
+  anchored target is preferred. Immunity is bound to the process's start time,
+  so a recycled pid does not inherit it. An omitted `[protect]` table defaults
+  `protect_self` to `true`.
 - `[app]` — what counts as "the application" for exec/egress/privesc/file
   attribution. A shell (or dial-out, or root-escalation) in the app cgroup is an
   incident; the same in an admin session is routine. An empty `cgroup_contains`

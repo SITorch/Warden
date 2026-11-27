@@ -107,27 +107,26 @@ io_weight = 20            # IOWeight=20 (relative, 1..10000)
 # kill_takedown_attacker still fires only for SIGKILL/SIGTERM/SIGSTOP/SIGQUIT/
 # SIGABRT from an unauthorized actor (W2K-42 leaves that list as it found it).
 #
-# W-R4 — read this before choosing a selector. Membership does two things: the
-# kernel reports a signal/ptrace against the pid as a takedown attempt, AND the
-# responder refuses to kill the pid. That is only useful if the RIGHT process is
-# in the set:
+# W-R4 / F09 — read this before choosing a selector. There are two decisions:
+# the kernel reports a signal/ptrace against a pid as a takedown attempt (the
+# tripwire), and the responder refuses to SIGKILL a pid (kill-immunity).
 #   comms            exact 15-byte comm. Any process can take a protected
-#                    process's name with prctl(PR_SET_NAME), so a comm entry
-#                    alone is a name, not an identity.
-#   cgroup_contains  substring of the cgroup path. The loosest selector — it
-#                    can match unrelated processes and is not a security
-#                    boundary.
+#                    name with prctl(PR_SET_NAME). F09: TRIPWIRE ONLY. It can
+#                    alert, but it can never make the responder refuse a kill.
+#   cgroup_contains  substring of the cgroup path. The loosest immunizing
+#                    selector — it can match unrelated processes and is not a
+#                    security boundary. Prefer an anchored target.
 #   [[protect.targets]]  every field it names must match (AND over
-#                    comm/exe/uid/cgroup). This is the strong option; prefer it
-#                    for anything that must not be impersonated. `uid` is the
-#                    REAL uid. A target that matches no live process is
-#                    reported in the journal — it protects nobody.
+#                    comm/exe/uid/cgroup). To grant immunity it must name at
+#                    least one of exe / real uid / exact cgroup; a comm-only
+#                    target is tripwire-only. A target that matches no live
+#                    process is reported in the journal — it protects nobody.
 #
-# Since W-R4, kill-immunity is also bound to the process's start time, so a
-# recycled pid does not inherit protection. The kernel tripwire map is still
-# keyed by pid alone (that is a kernel-side limitation, documented in DESIGN.md).
+# Kill-immunity is bound to the process's start time, so a recycled pid does
+# not inherit protection. The kernel tripwire map is still pid-keyed (a
+# kernel-side limitation, documented in DESIGN.md); F09 does not change it.
 [protect]
-comms = ["granian", "celery", "daphne"]   # match by exact process comm
+comms = ["granian", "celery", "daphne"]   # tripwire only; not kill-immunity
 cgroup_contains = []                        # e.g. ["sentinel.service"] to match a unit
 protect_self = true
 

@@ -9,11 +9,12 @@
 //! that pair. Without it, "pid 4711 is protected" stays true after 4711 has been
 //! recycled, and protection becomes something an unrelated process inherits.
 //!
-//! The other half of W-R4 is *how a process gets in here at all*. The legacy
-//! selectors are a 15-byte comm an attacker can set with `prctl(PR_SET_NAME)`
-//! and a cgroup substring; [`Protect::protects`] adds identity tuples that
-//! AND over exe/uid/exact-cgroup, which is what the audit prescribes for
-//! anything that decides whether a process may be killed.
+//! The other half of W-R4 is *how a process gets in here at all*. F09 narrows
+//! that decision: a 15-byte comm an attacker can set with `prctl(PR_SET_NAME)`
+//! is a display attribute and may only feed the PID-keyed tripwire map, never
+//! the userspace immunity set. Anchored [`ProtectTarget`] tuples AND over
+//! exe/uid/exact-cgroup, and `cgroup_contains` remains a pre-existing selector,
+//! are what may grant kill immunity.
 //!
 //! The third thing this module does is answer "am I the only one?" — see
 //! [`peer_instances`] and W2K-43. It is a /proc walk for the same reason the
@@ -147,18 +148,13 @@ impl ProtectTarget {
 }
 
 impl Protect {
-    /// Whether this policy protects the process behind `id`.
+    /// Whether this policy grants **kill immunity** to the process behind `id`.
     ///
-    /// Legacy selectors and `[[protect.targets]]` are ORed, so adding a target
-    /// can never take protection away from a process an existing selector
-    /// already covered — the property that makes this change safe to ship to a
-    /// deployment whose `warden.toml` nobody is going to re-read.
-    pub fn protects(&self, id: &ProcIdentity) -> bool {
-        if let Some(c) = &id.comm {
-            if self.comms.iter().any(|want| want == c) {
-                return true;
-            }
-        }
+    /// F09: a `comm` value, including a comm-only `[[protect.targets]]` entry,
+    /// is not an authorization fact. It can never produce `Action::Refused`.
+    /// `cgroup_contains` keeps its pre-existing behavior; anchored targets must
+    /// name at least one field the process cannot simply set for itself.
+    pub fn grants_immunity(&self, id: &ProcIdentity) -> bool {
         if let Some(cg) = &id.cgroup {
             if self
                 .cgroup_contains
@@ -168,39 +164,60 @@ impl Protect {
                 return true;
             }
         }
-        self.targets.iter().any(|t| t.matches(id))
+        self.targets
+            .iter()
+            .any(|t| t.names_identity() && t.matches(id))
     }
-}
 
-/// The pre-W-R4 matching rule, kept exactly as it was: exact comm, or a cgroup
-/// substring.
-///
-/// Run on its own — never alongside [`Protect::protects`] — when no
-/// `[[protect.targets]]` are configured, so a deployment that has not opted into
-/// identity matching pays no extra /proc reads on every tick.
-///
-/// The one change is the emptiness test. `cgroup_contains = [""]` used to match
-/// every process on the host, because every string contains the empty string;
-/// treating a blank needle as absent is the only reading of it that could have
-/// been intended.
-fn legacy_match(cfg: &Protect, pid: u32) -> bool {
-    if !cfg.comms.is_empty() {
-        if let Some(c) = comm_of(pid) {
-            if cfg.comms.iter().any(|want| want == &c) {
+    /// Whether this policy should place the process in the PID-keyed tripwire
+    /// map for signal/ptrace alerting only.
+    ///
+    /// This deliberately includes the weak selectors excluded from
+    /// [`Protect::grants_immunity`]: losing the alert when a process copies a
+    /// protected name would trade one false signal for a silent coverage gap.
+    pub fn matches_tripwire(&self, id: &ProcIdentity) -> bool {
+        if let Some(c) = &id.comm {
+            if self.comms.iter().any(|want| want == c) {
                 return true;
             }
         }
+        self.targets
+            .iter()
+            .any(|t| !t.names_identity() && t.matches(id))
     }
-    if let Some(cg) = cgroup_of(pid) {
-        if cfg
-            .cgroup_contains
+
+    /// Combined monitoring membership, retained for callers that need the
+    /// historical meaning of “covered by `[protect]`”.
+    ///
+    /// Enforcement decisions must use [`Protect::grants_immunity`], never this
+    /// broader predicate.
+    pub fn protects(&self, id: &ProcIdentity) -> bool {
+        self.grants_immunity(id) || self.matches_tripwire(id)
+    }
+}
+
+/// The cheap comm-only half of the legacy path, used when no
+/// `[[protect.targets]]` are configured. F09 keeps it for tripwire alerting but
+/// never lets it populate the userspace immunity set.
+fn legacy_comm_match(cfg: &Protect, pid: u32) -> bool {
+    if cfg.comms.is_empty() {
+        return false;
+    }
+    comm_of(pid).is_some_and(|c| cfg.comms.iter().any(|want| want == &c))
+}
+
+/// The cgroup-substring half of the legacy path. It remains an immunizing
+/// selector in this release; only `comm` is narrowed by F09.
+///
+/// A blank needle is ignored. `cgroup_contains = [""]` used to match every
+/// process because every string contains the empty string, which was never a
+/// usable meaning.
+fn legacy_cgroup_match(cfg: &Protect, pid: u32) -> bool {
+    cgroup_of(pid).is_some_and(|cg| {
+        cfg.cgroup_contains
             .iter()
             .any(|needle| !needle.trim().is_empty() && cg.contains(needle.as_str()))
-        {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// The resolved protected set: each pid with the start time it had when it was
@@ -218,6 +235,14 @@ pub struct Protected {
 impl Protected {
     pub fn insert(&mut self, pid: u32, starttime: Option<u64>) {
         self.recorded.insert(pid, starttime);
+    }
+
+    /// Fold another identity table into this one. Later values win for a pid
+    /// that appears in both; callers decide which table has precedence.
+    pub fn merge(&mut self, other: &Protected) {
+        for (pid, starttime) in &other.recorded {
+            self.recorded.insert(*pid, *starttime);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -273,7 +298,16 @@ impl Protected {
 /// What one walk of /proc produced.
 #[derive(Debug, Clone, Default)]
 pub struct Resolution {
+    /// PIDs that may receive `Action::Refused`. Only anchored selectors and
+    /// `protect_self` populate this set after F09.
     pub protected: Protected,
+    /// PIDs that are visible to the kernel's signal/ptrace tripwire but are
+    /// never consulted by the responder's immunity decision (F09).
+    ///
+    /// Start times are retained here too: the kernel map is PID-keyed, so the
+    /// detection side needs to tell a recycled tripwire pid from the process
+    /// the policy actually matched before reporting a takedown.
+    pub tripwire: Protected,
     /// One line per configured `[[protect.targets]]` entry that matched no live
     /// process.
     ///
@@ -287,11 +321,48 @@ pub struct Resolution {
     pub unmatched_targets: Vec<String>,
 }
 
+impl Resolution {
+    /// Everything the kernel's PID-keyed `protected_pids` map should contain.
+    ///
+    /// The union preserves signal/ptrace alerting for weak selectors without
+    /// letting those PIDs into the userspace immunity set.
+    pub fn all_pids(&self) -> BTreeSet<u32> {
+        self.protected
+            .pids()
+            .union(&self.tripwire.pids())
+            .copied()
+            .collect()
+    }
+
+    /// PIDs that are in the tripwire map but not the immunity set. Used only
+    /// for operator-facing counts; enforcement must use `protected`.
+    pub fn tripwire_only_pids(&self) -> BTreeSet<u32> {
+        self.tripwire
+            .pids()
+            .difference(&self.protected.pids())
+            .copied()
+            .collect()
+    }
+
+    /// The full identity table behind the kernel map: immunity entries take
+    /// precedence over tripwire-only entries for a shared pid.
+    ///
+    /// This is given to the judges so they can still prove PID reuse for a
+    /// tripwire-only match. It is never passed to the responder, which must
+    /// continue to see only `protected`.
+    pub fn kernel_identity(&self) -> Protected {
+        let mut identity = self.tripwire.clone();
+        identity.merge(&self.protected);
+        identity
+    }
+}
+
 /// Resolve the protect policy to the concrete processes to guard. Always
 /// includes Warden's own pid when `protect_self`, so an attacker can't
 /// decapitate the guardian without tripping the takedown sensor.
 pub fn resolve_protected(cfg: &Protect) -> Resolution {
     let mut protected = Protected::default();
+    let mut tripwire = Protected::default();
     let mut matched_target = vec![false; cfg.targets.len()];
 
     if cfg.protect_self {
@@ -303,6 +374,7 @@ pub fn resolve_protected(cfg: &Protect) -> Resolution {
     if cfg.comms.is_empty() && cfg.cgroup_contains.is_empty() && cfg.targets.is_empty() {
         return Resolution {
             protected,
+            tripwire,
             unmatched_targets: Vec::new(),
         };
     }
@@ -313,20 +385,25 @@ pub fn resolve_protected(cfg: &Protect) -> Resolution {
     let by_identity = !cfg.targets.is_empty();
 
     for pid in all_pids() {
-        let hit = if by_identity {
+        let (immune, tripwire_hit) = if by_identity {
             let id = ProcIdentity::read(pid);
             for (i, t) in cfg.targets.iter().enumerate() {
                 if t.matches(&id) {
                     matched_target[i] = true;
                 }
             }
-            cfg.protects(&id)
+            (cfg.grants_immunity(&id), cfg.matches_tripwire(&id))
         } else {
-            legacy_match(cfg, pid)
+            (legacy_cgroup_match(cfg, pid), legacy_comm_match(cfg, pid))
         };
 
-        if hit {
+        // F09: only the anchored half records a start time and reaches the
+        // responder's immunity check. A comm match is still worth an alert.
+        if immune {
             protected.insert(pid, starttime_of(pid));
+        }
+        if tripwire_hit {
+            tripwire.insert(pid, starttime_of(pid));
         }
     }
 
@@ -342,6 +419,7 @@ pub fn resolve_protected(cfg: &Protect) -> Resolution {
 
     Resolution {
         protected,
+        tripwire,
         unmatched_targets,
     }
 }
@@ -730,12 +808,45 @@ mod tests {
     }
 
     #[test]
-    fn resolves_our_own_comm() {
-        // Whatever the test harness comm is, matching it must find at least us.
-        let me = comm_of(std::process::id()).expect("own comm readable");
-        let cfg = policy(vec![me.as_str()], vec![], false);
+    fn a_comm_only_policy_is_tripwire_but_never_immunity() {
+        // F09: whatever the harness comm is, a comm-only selector may alert on
+        // us but must not grant us `Action::Refused`.
+        let me = std::process::id();
+        let own_comm = comm_of(me).expect("own comm readable");
+        let cfg = policy(vec![own_comm.as_str()], vec![], false);
         let set = resolve_protected(&cfg);
-        assert!(set.protected.pids().contains(&std::process::id()));
+
+        assert!(
+            set.protected.is_empty(),
+            "a mutable comm must never populate the immunity set"
+        );
+        assert!(
+            set.tripwire.pids().contains(&me),
+            "the tripwire must still see the comm match"
+        );
+        assert!(
+            set.all_pids().contains(&me),
+            "the kernel map keeps alert coverage for weak selectors"
+        );
+    }
+
+    #[test]
+    fn tripwire_only_pids_keep_an_identity_for_the_judges() {
+        let me = std::process::id();
+        let own_comm = comm_of(me).expect("own comm readable");
+        let cfg = policy(vec![own_comm.as_str()], vec![], false);
+        let set = resolve_protected(&cfg);
+        let live = starttime_of(me);
+
+        assert!(set.tripwire_only_pids().contains(&me));
+        assert!(
+            set.kernel_identity().immune(me, live),
+            "the detection side must still be able to prove this pid was not recycled"
+        );
+        assert!(
+            !set.protected.immune(me, live),
+            "but the responder must never see it as immune"
+        );
     }
 
     #[test]
@@ -833,10 +944,11 @@ mod tests {
         assert!(!t.matches(&id));
     }
 
-    /// Legacy selectors keep working alongside targets, and are ORed with them,
-    /// so adding a target can never take protection away.
+    /// F09: a legacy comm match still produces a tripwire record next to an
+    /// anchored target, but it no longer produces immunity. Adding a strong
+    /// target does not silently re-enable the weak path.
     #[test]
-    fn legacy_selectors_still_match_next_to_targets() {
+    fn legacy_comm_is_tripwire_only_next_to_a_strong_target() {
         let mut cfg = policy(vec!["legacy"], vec![], false);
         cfg.targets = vec![target(
             Some("granian"),
@@ -845,9 +957,91 @@ mod tests {
             None,
         )];
 
-        assert!(cfg.protects(&identity("legacy", "/tmp/x", 1, "/x")));
-        assert!(cfg.protects(&identity("granian", "/usr/bin/granian", 2, "/x")));
-        assert!(!cfg.protects(&identity("granian", "/tmp/evil", 2, "/x")));
+        let weak = identity("legacy", "/tmp/x", 1, "/x");
+        assert!(cfg.matches_tripwire(&weak));
+        assert!(!cfg.grants_immunity(&weak));
+
+        let strong = identity("granian", "/usr/bin/granian", 2, "/x");
+        assert!(cfg.grants_immunity(&strong));
+
+        let spoof = identity("granian", "/tmp/evil", 2, "/x");
+        assert!(!cfg.grants_immunity(&spoof));
+        assert!(!cfg.matches_tripwire(&spoof));
+    }
+
+    #[test]
+    fn a_comm_only_target_cannot_grant_immunity() {
+        let cfg = policy(vec![], vec![], false);
+        let mut cfg = cfg;
+        cfg.targets = vec![target(Some("granian"), None, None, None)];
+
+        let spoof = identity("granian", "/tmp/evil", 1000, "/user.slice/x");
+        assert!(cfg.matches_tripwire(&spoof));
+        assert!(
+            !cfg.grants_immunity(&spoof),
+            "a target naming only `comm` is no stronger than `comms`"
+        );
+        assert!(cfg.protects(&spoof), "combined monitoring still sees it");
+    }
+
+    #[test]
+    fn an_anchored_target_without_comm_survives_a_name_change() {
+        let me = std::process::id();
+        let id = ProcIdentity::read(me);
+        let exe = id.exe.clone().expect("own executable must be readable");
+        let uid = id.uid.expect("own uid must be readable");
+
+        let mut cfg = policy(vec![], vec![], false);
+        cfg.targets = vec![target(None, Some(&exe), Some(uid), None)];
+        assert!(cfg.grants_immunity(&id));
+
+        let mut renamed = id.clone();
+        renamed.comm = Some("renamed-f09".into());
+        assert!(
+            cfg.grants_immunity(&renamed),
+            "a rename must not change immunity when the target does not name comm"
+        );
+
+        let mut replaced_exe = id;
+        replaced_exe.exe = Some("/tmp/evil".into());
+        assert!(!cfg.grants_immunity(&replaced_exe));
+    }
+
+    #[test]
+    fn a_comm_named_target_drops_immunity_on_rename() {
+        let id = ProcIdentity::read(std::process::id());
+        let exe = id.exe.clone().expect("own executable must be readable");
+        let uid = id.uid.expect("own uid must be readable");
+        let comm = id.comm.clone().expect("own comm must be readable");
+
+        let mut cfg = policy(vec![], vec![], false);
+        cfg.targets = vec![target(Some(&comm), Some(&exe), Some(uid), None)];
+        assert!(cfg.grants_immunity(&id));
+
+        let mut renamed = id;
+        renamed.comm = Some("renamed-f09".into());
+        assert!(
+            !cfg.grants_immunity(&renamed),
+            "when the target names comm, changing it must end the match"
+        );
+    }
+
+    #[test]
+    fn rebuilding_from_a_comm_only_policy_drops_prior_immunity() {
+        let me = std::process::id();
+        let id = ProcIdentity::read(me);
+        let exe = id.exe.clone().expect("own executable must be readable");
+        let uid = id.uid.expect("own uid must be readable");
+        let comm = id.comm.clone().expect("own comm must be readable");
+
+        let mut anchored = policy(vec![], vec![], false);
+        anchored.targets = vec![target(Some(&comm), Some(&exe), Some(uid), None)];
+        assert!(resolve_protected(&anchored).protected.pids().contains(&me));
+
+        let weak = policy(vec![comm.as_str()], vec![], false);
+        let rebuilt = resolve_protected(&weak);
+        assert!(rebuilt.protected.is_empty());
+        assert!(rebuilt.tripwire.pids().contains(&me));
     }
 
     #[test]

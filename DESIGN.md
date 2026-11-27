@@ -431,13 +431,14 @@ were conflated in earlier drafts, and the difference is the whole point of W-R1.
   pid-keyed.** `[protect]` membership decides two different things: which pids
   the kernel tripwire reports a signal/ptrace against, and which pids the
   responder refuses to kill. Both used to be selected by exact `comm` — a
-  15-byte name any process sets with `prctl(PR_SET_NAME)` — or a cgroup
-  substring, so a spoofed name bought both a false takedown finding and immunity
-  from the responder (W-R4). The selector now also accepts `[[protect.targets]]`,
-  an identity tuple that ANDs `comm`, `exe`, the **real** uid and the exact
-  cgroup path; the legacy selectors are ORed with it, so an existing policy never
-  loses coverage. A target that matches no live process is reported at load,
-  because silence there would read as protection that does not exist.
+  15-byte name any process sets with `prctl(PR_SET_NAME)` — so a spoofed name
+  bought both a false takedown finding and kill immunity (F09). The tripwire is
+  preserved for `comms` and comm-only targets, but F09 excludes them from the
+  userspace immunity set: only `protect_self`, `cgroup_contains` (pre-existing
+  behavior) and `[[protect.targets]]` entries that name `exe`, the **real** uid
+  or the exact cgroup path can produce `Action::Refused`. A target that matches
+  no live process is reported at load, because silence there would read as
+  protection that does not exist.
   Kill-immunity is bound to the `(pid, starttime)` identity
   (`src/procscan.rs`), so a recycled pid does not inherit it. The same binding now
   guards the *reporting* path too (W2K-10): `judge_signal`/`judge_ptrace` compare

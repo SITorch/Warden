@@ -937,11 +937,13 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
     }
 
     let resolution = procscan::resolve_protected(&cfg.protect);
-    let n = loaded.sync_protected(&resolution.protected.pids())?;
+    let n = loaded.sync_protected(&resolution.all_pids())?;
+    let kernel_identity = resolution.kernel_identity();
     log_protect_policy(&cfg.protect, &resolution);
     log::info!(
-        "protecting {} pid(s) ({} pushed to kernel)",
+        "protecting {} immune pid(s), {} tripwire-only pid(s) ({} pushed to kernel)",
         resolution.protected.len(),
+        resolution.tripwire_only_pids().len(),
         n
     );
     let mut protected = resolution.protected;
@@ -978,10 +980,11 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
     // egress disabled it gets `None` — every DENY rule stays observe-only —
     // so a config toggle alone can never upgrade a finding's claim.
     detector.set_egress_preflight(cfg.egress.enabled.then_some(egress_startup_preflight));
-    // W2K-10: the kernel's protected map is pid-keyed, so the judges need the
-    // start times this map was written from to tell a takedown from a recycled
-    // pid. Same object, same tick as every `sync_protected` below.
-    detector.set_protected(protected.clone());
+    // W2K-10 / F09: the kernel's protected map is pid-keyed, so the judges need
+    // the start times this map was written from — including tripwire-only pids —
+    // to tell a takedown from a recycled pid. The responder still receives only
+    // `protected`, never this broader table.
+    detector.set_protected(kernel_identity);
     warn_if_no_app_cgroup(&cfg);
     // The pull path. Its state is the previous snapshot plus everything the
     // sensors named, because the report is a comparison of those two and not a
@@ -1081,7 +1084,8 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
                     // rather than going quiet after one report.
                     let unapplied = unapplied_reload_changes(&cfg, &fresh);
                     let protect_resolution = procscan::resolve_protected(&fresh.protect);
-                    loaded.sync_protected(&protect_resolution.protected.pids())?;
+                    loaded.sync_protected(&protect_resolution.all_pids())?;
+                    let reload_kernel_identity = protect_resolution.kernel_identity();
                     log_protect_policy(&fresh.protect, &protect_resolution);
                     protected = protect_resolution.protected;
                     last_unmatched = protect_resolution.unmatched_targets;
@@ -1170,8 +1174,9 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
                     detector
                         .set_egress_preflight(fresh_egress_enabled.then_some(fresh_egress_proof));
                     // A fresh detector means a fresh identity table too — the new
-                    // policy's protected set was pushed to the kernel just above.
-                    detector.set_protected(protected.clone());
+                    // policy's full kernel set was pushed above. Tripwire-only pids
+                    // are included for the judges but never for the responder.
+                    detector.set_protected(reload_kernel_identity);
                     warn_if_no_app_cgroup(detector.config());
                     // The pull path is the opposite of `[bridge]`: it holds no thread and
                     // no kernel object, so a reload applies it completely. Say what moved,
@@ -1262,14 +1267,15 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
         // Periodic protected-set reconciliation.
         if last_refresh.elapsed() >= PROTECT_REFRESH {
             let fresh = procscan::resolve_protected(&detector.config().protect);
-            let pids = fresh.protected.pids();
-            // Push only when the *set* changed. The kernel map is pid-keyed, so
-            // an unchanged set needs no syscalls; identity (start time) is a
-            // userspace-only concern and is adopted below regardless.
-            if pids != protected.pids() {
-                let added = loaded.sync_protected(&pids)?;
+            let pids = fresh.all_pids();
+            // Reconcile unconditionally. `sync_protected` diffs against the
+            // kernel map itself, so an unchanged set costs no writes; comparing
+            // against the userspace *immunity* set here would silently leave a
+            // removed tripwire-only pid in the kernel map (F09).
+            let added = loaded.sync_protected(&pids)?;
+            if added > 0 {
                 log::debug!(
-                    "protected set changed: {} pid(s), {} newly pushed",
+                    "protected set reconciled: {} pid(s), {} newly pushed",
                     pids.len(),
                     added
                 );
@@ -1285,11 +1291,11 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
                 log_protect_policy(&detector.config().protect, &fresh);
                 last_unmatched = fresh.unmatched_targets.clone();
             }
+            // W2K-10 / F09: keep the judges' view in step with the whole map
+            // the kernel holds, tripwire-only pids included. The responder's
+            // `protected` below stays immunity-only.
+            detector.set_protected(fresh.kernel_identity());
             protected = fresh.protected;
-            // W2K-10: keep the judges' view in step with the map the kernel
-            // holds. Both move on this same tick, so a recycled target pid is
-            // only ever misclaimed for the remainder of one refresh window.
-            detector.set_protected(protected.clone());
             // Re-resolve the guarded set on the same tick. A guarded file rewritten
             // in place gets a NEW inode; without this re-stat the kernel map would
             // keep pointing at the old, now-unlinked inode and silently guard
@@ -2037,24 +2043,38 @@ fn unapplied_reload_changes(running: &Config, fresh: &Config) -> Vec<String> {
     changes
 }
 
-/// Say once per policy load which `[protect]` selectors are spoofable and which
+/// Say once per policy load which `[protect]` selectors are weak and which
 /// targets matched nothing.
 ///
-/// W-R4: both facts used to be invisible. A comm entry or a cgroup substring is
-/// selectable by any process (`prctl(PR_SET_NAME)`, and cgroup names are not a
-/// security boundary), so naming them tells an operator where
-/// `[[protect.targets]]` would be stronger. A target that matches no live
-/// process — an `exe` under `hidepid=`, a 15-byte-truncated comm, a uid nobody
-/// runs as — protects nothing, and silence there reads as protection that does
-/// not exist.
+/// F09: `comms` and comm-only targets are tripwire-only and are reported as
+/// such. They cannot produce `Action::Refused`; kill immunity requires either
+/// `protect_self`, a `cgroup_contains` match (pre-existing behavior), or an
+/// anchored `[[protect.targets]]`. W-R4: a target that matches no live process
+/// — an `exe` under `hidepid=`, a 15-byte-truncated comm, a uid nobody runs as —
+/// protects nothing, and silence there reads as protection that does not exist.
 fn log_protect_policy(protect: &config::Protect, resolved: &procscan::Resolution) {
-    for weak in protect.weak_selectors() {
-        log::warn!("[protect] {weak}");
+    for (class, notice) in protect.selector_notices() {
+        match class {
+            config::ProtectSelectorClass::TripwireOnly => {
+                log::warn!("[protect] {notice} — tripwire only; it cannot grant SIGKILL immunity")
+            }
+            config::ProtectSelectorClass::Ignored => log::warn!("[protect] {notice}"),
+            config::ProtectSelectorClass::LooseImmunity => {
+                // F09 deliberately leaves cgroup_contains immunizing. Calling
+                // it tripwire-only would tell operators the wrong thing about
+                // a real enforcement exemption.
+                log::warn!(
+                    "[protect] {notice} — loose but still immunizing; prefer an anchored target"
+                )
+            }
+        }
     }
     if resolved.protected.is_empty() {
         log::warn!(
-            "[protect] the resolved set is empty — nothing on this host is protected, \
-             including Warden itself (protect_self=false and no selector matched)"
+            "[protect] the immunity set is empty — nothing on this host may refuse a kill, \
+             including Warden itself (protect_self=false, no cgroup_contains match and no \
+             anchored selector matched). {} pid(s) remain in the tripwire-only alert set",
+            resolved.tripwire_only_pids().len()
         );
     }
     if !resolved.unmatched_targets.is_empty() {
