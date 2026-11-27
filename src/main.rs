@@ -35,6 +35,7 @@ mod policy;
 mod procscan;
 mod resources;
 mod respond;
+mod safe_log;
 mod telemetry;
 mod tls;
 
@@ -1740,24 +1741,27 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
             stats.findings += 1;
 
             let action = responder.act(&finding, &protected);
+            // Enqueue first so the local line can carry the same stable event id
+            // as the remote envelope. The journal gets an allowlisted summary;
+            // `Finding.summary`/`detail` remain in the remote record only.
+            let event_id = deliverer.as_ref().map(|d| d.enqueue(&finding, action));
             if log_throttle.admit(
                 finding.process.pid,
                 finding.event_type_str(),
                 Instant::now(),
             ) {
                 log::warn!(
-                    "[{}] {} — {} (action={})",
-                    finding.severity_str(),
-                    finding.event_type_str(),
-                    finding.summary,
-                    action.as_str()
+                    "{}",
+                    safe_log::FindingLog::new(
+                        event_id.as_deref(),
+                        finding.severity_str(),
+                        finding.event_type_str(),
+                        action.as_str(),
+                        finding.process.pid,
+                    )
                 );
             } else {
                 stats.suppressed_logs += 1;
-            }
-
-            if let Some(d) = &deliverer {
-                d.enqueue(&finding, action);
             }
         }
     }

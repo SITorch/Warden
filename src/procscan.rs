@@ -1642,7 +1642,7 @@ mod tests {
         assert!(!args.is_empty(), "an execed process has an argv[0]");
         assert!(
             !cmdline_is_inspection(&args),
-            "a test harness is not a warden inspection mode: {args:?}"
+            "a test harness is not a warden inspection mode"
         );
 
         // No such pid, and the kernel-thread shape: no command line at all.

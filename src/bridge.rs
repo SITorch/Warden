@@ -1106,6 +1106,29 @@ mod tests {
     }
 
     #[test]
+    fn api_key_canary_never_survives_safe_log_redaction() {
+        // The wire head must carry the configured key; a journal line derived
+        // from that head must not. Distinctive synthetic canary, never a real
+        // credential.
+        const KEY_CANARY: &str = "CANARY_NOT_REAL_BRIDGE_KEY_5c1a";
+        let cfg: Bridge = toml::from_str(&format!(
+            "url = \"http://127.0.0.1:9099/api/\"\napi_key = \"{KEY_CANARY}\"\nspool_path = \"/tmp/warden-bridge-canary-spool.jsonl\"\n"
+        ))
+        .unwrap_or_else(|_| panic!("canary bridge config must parse"));
+        let client = BridgeClient::new(cfg).expect("loopback client");
+        let head = client.request_head(2);
+        assert!(head.contains(KEY_CANARY), "request head must carry the key");
+
+        let safe = crate::safe_log::redact_secrets(&head);
+        assert!(
+            !safe.contains(KEY_CANARY),
+            "safe log text must not carry the API key canary"
+        );
+        assert!(safe.contains("X-API-Key:"), "key name remains auditable");
+        assert!(safe.contains("[REDACTED]"), "value is explicitly masked");
+    }
+
+    #[test]
     fn rejects_malformed_ipv6_and_ports_loudly() {
         for url in [
             "http://[::1/api/",           // unclosed bracket
@@ -1128,11 +1151,19 @@ mod tests {
         assert_eq!(client.target.host, "::1");
         assert_eq!(client.target.host_header, "[::1]");
         let head = client.request_head(2);
-        assert!(head.contains("Host: [::1]\r\n"), "header: {head:?}");
-        assert!(!head.contains("Host: [::1]:"), "header: {head:?}");
+        // The head carries X-API-Key. Assert only on the safe Host/request-line
+        // slices; never print the whole head in a failure message.
+        assert!(
+            head.contains("Host: [::1]\r\n"),
+            "Host header must bracket the IPv6 literal"
+        );
+        assert!(
+            !head.contains("Host: [::1]:"),
+            "Host header must not add a port that was not configured"
+        );
         assert!(
             head.starts_with("POST /api/ HTTP/1.1\r\n"),
-            "header: {head:?}"
+            "request line must use the parsed path"
         );
     }
 

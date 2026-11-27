@@ -435,11 +435,35 @@ mod tests {
             .args(args)
             .output()
             .expect("openssl must be available for the mandatory TLS matrix");
+        // A failing OpenSSL invocation must not print its argv: those values
+        // include private-key and certificate paths. The allowlisted flag/command
+        // summary keeps enough context to identify the failing test step.
         assert!(
             out.status.success(),
-            "openssl {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "openssl command failed ({})",
+            crate::safe_log::safe_command_summary(args)
         );
+    }
+
+    #[test]
+    fn openssl_diagnostics_do_not_echo_private_key_paths() {
+        const KEY_PATH_CANARY: &str = "/tmp/CANARY_NOT_REAL_PRIVATE_KEY_PATH_2b17.pem";
+        let summary = crate::safe_log::safe_command_summary(&[
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            KEY_PATH_CANARY,
+            "-subj",
+            "/CN=warden-agent",
+        ]);
+        assert!(
+            !summary.contains(KEY_PATH_CANARY),
+            "command diagnostics must not echo the key path"
+        );
+        assert!(summary.contains("req"));
+        assert!(summary.contains("-keyout"));
     }
 
     struct Fixtures {
@@ -792,7 +816,10 @@ mod tests {
         let missing = dir.join(format!("warden-tls-missing-{}", std::process::id()));
         let err = TlsContext::new(&missing, &missing, &missing).unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("CA certificate"), "{text}");
+        assert!(
+            text.contains("CA certificate"),
+            "missing-material error must name the CA certificate"
+        );
     }
 
     #[test]

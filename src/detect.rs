@@ -495,16 +495,15 @@ pub(crate) fn signal_stops_target(sig: u32) -> bool {
 /// Callers reach this only after the parent check has been answered, so the sentence
 /// says what the hook ruled out rather than re-deriving it.
 fn identity_note(proc: &ProcessInfo) -> String {
+    // The actor's uid stays in the finding detail for the remote record, but
+    // it has no place in a phrase that can be copied into a local log: it is
+    // an account identifier, not an operational correlate. PID and executable
+    // evidence still say what the kernel could verify.
     let who = match proc.exe.as_deref() {
-        Some(path) => format!(
-            "{} uid {} running {}",
-            proc.comm,
-            proc.uid,
-            exe_identity(path)
-        ),
+        Some(path) => format!("{} running {}", proc.comm, exe_identity(path)),
         None => format!(
-            "{} uid {} whose executable could not be read — identity NOT verified",
-            proc.comm, proc.uid
+            "{} whose executable could not be read — identity NOT verified",
+            proc.comm
         ),
     };
     // Three different things a small pid number can mean, and the old two-way test
@@ -1712,8 +1711,8 @@ impl Detector {
             (
                 Severity::Critical,
                 format!(
-                    "privilege escalation: pid {} ({}) became root (uid {}→0) inside the application",
-                    proc.pid, proc.comm, change.old_uid
+                    "privilege escalation: pid {} ({}) became root inside the application",
+                    proc.pid, proc.comm
                 ),
             )
         } else {
@@ -2563,16 +2562,14 @@ impl Detector {
         };
 
         let summary = format!(
-            "guarded-file access {}: pid {} ({}) uid {} tried to {} a guarded inode \
-             (dev={}, ino={}); authorized uid is {}",
+            "guarded-file access {}: pid {} ({}) tried to {} a guarded inode \
+             (dev={}, ino={})",
             verb,
             proc.pid,
             proc.comm,
-            proc.uid,
             a.hook.as_str(),
             a.dev,
             a.ino,
-            a.authorized_uid,
         );
 
         Some(Finding {
@@ -2912,7 +2909,10 @@ mod tests {
             actor_ppid: 1,
             actor_uid: old_uid,
             target_pid: 0,
-            aux: new_uid,
+            // CREDS judges read `creds`, not `aux`. Keeping the new uid out of
+            // this generic slot stops a synthetic fixture from manufacturing a
+            // second, log-visible copy of the credential-field source.
+            aux: 0,
             ts_ns: 0,
             comm: comm.into(),
             filename: String::new(),
@@ -3729,8 +3729,7 @@ mod tests {
             .contains("expected_privilege_exes"));
         assert!(
             f.summary.contains("/tmp/.cache/sudo-shim"),
-            "the summary must name the executable behind the borrowed name: {}",
-            f.summary
+            "the summary must name the executable behind the borrowed name"
         );
 
         // The same actor with a name nobody claimed is the ordinary finding: the
@@ -4648,8 +4647,7 @@ mod tests {
         assert_eq!(f.detail["loader_exe"], serde_json::Value::Null);
         assert!(
             f.summary.contains("STILL RUNNING"),
-            "the summary has to name the live loader: {}",
-            f.summary
+            "the summary has to name the live loader"
         );
         // And it has to say what closes it, because pinning a comm answers nothing.
         assert!(f.detail["how_to_authorize"]
@@ -4689,8 +4687,7 @@ mod tests {
             .contains("allow_loader_exes"));
         assert!(
             f.summary.contains(exe_identity(&my_exe)),
-            "the summary must name the executable it judged: {}",
-            f.summary
+            "the summary must name the executable it judged"
         );
         // The same actor under its own (unlisted) name is the same finding: the
         // verdict is the path, and the name only changes the `reason` label.
@@ -4833,8 +4830,7 @@ mod tests {
         assert!(f.detail["authorization"].to_string().contains("dev/ino"));
         assert!(
             f.summary.contains(&stranger.label()),
-            "the summary must quote the identity it judged: {}",
-            f.summary
+            "the summary must quote the identity it judged"
         );
         assert!(f.detail["how_to_authorize"]
             .as_str()
@@ -5506,6 +5502,65 @@ mod tests {
     }
 
     #[test]
+    fn uid_canaries_never_appear_in_operator_facing_summary_text() {
+        // Distinctive synthetic account ids, never real uids. They remain in the
+        // structured detail for remote telemetry; only the human-readable string
+        // that can flow into a log line must stop carrying them.
+        const OLD_UID_CANARY: u32 = 424_242_001;
+        const AUTHORIZED_UID_CANARY: u32 = 424_242_991;
+
+        let cred_det = cred_detector_with(CredRules::default());
+        let access_det = Detector::new(Config::safe_default());
+        let creds = creds_event("sudo", OLD_UID_CANARY, 0, 0, 0);
+        let mut access = access_event(AccessHook::Open, WARDEN_INTENT_READ, true, 0);
+        if let Some(a) = access.access.as_mut() {
+            a.authorized_uid = AUTHORIZED_UID_CANARY;
+        }
+
+        let cred_finding = cred_det
+            .judge(&creds)
+            .expect("a synthetic root transition must fire");
+        let access_finding = access_det
+            .judge(&access)
+            .expect("a synthetic guarded denial must fire");
+
+        assert!(
+            !cred_finding.summary.contains(&OLD_UID_CANARY.to_string()),
+            "privilege summary must not carry an account id"
+        );
+        assert_eq!(
+            cred_finding.detail["old_uid"], OLD_UID_CANARY,
+            "structured telemetry keeps the account id"
+        );
+        assert!(
+            !access_finding
+                .summary
+                .contains(&AUTHORIZED_UID_CANARY.to_string()),
+            "guarded-access summary must not carry an account id"
+        );
+        assert_eq!(
+            access_finding.detail["authorized_uid"], AUTHORIZED_UID_CANARY,
+            "structured telemetry keeps the authorized account id"
+        );
+
+        let proc = ProcessInfo {
+            pid: 4242,
+            ppid: 1,
+            uid: OLD_UID_CANARY,
+            comm: "canary-comm".to_string(),
+            exe: Some("/usr/bin/canary".to_string()),
+            cmdline: None,
+            cgroup: None,
+            starttime: Some(7),
+        };
+        let note = identity_note(&proc);
+        assert!(
+            !note.contains(&OLD_UID_CANARY.to_string()),
+            "identity note must not carry an account id"
+        );
+    }
+
+    #[test]
     fn an_armed_guarded_access_denial_is_a_high_finding() {
         // The crown-jewels tripwire firing: an unauthorised uid tried to open a
         // guarded file for read and the armed guard returned -EPERM in-kernel.
@@ -5957,7 +6012,10 @@ mod tests {
             assert_eq!(f.severity, Severity::Info, "signal {sig} was escalated");
             assert_eq!(f.detail["signal_effect"], "inert");
             assert_eq!(f.detail["reason"], "inert_signal");
-            assert!(f.summary.contains("control traffic"), "{}", f.summary);
+            assert!(
+                f.summary.contains("control traffic"),
+                "summary must name control traffic"
+            );
             assert!(
                 !f.wants_kill,
                 "a signal that cannot stop the target must not arm a kill"
@@ -6006,11 +6064,14 @@ mod tests {
                 !f.wants_kill,
                 "counter-killing pid 1 would take the host down, whatever the number"
             );
-            assert!(f.summary.contains("service control"), "{}", f.summary);
+            assert!(
+                f.summary.contains("service control"),
+                "summary must name service control"
+            );
             let authorization = f.detail["authorization"].as_str().unwrap_or_default();
             assert!(
                 authorization.contains("init, a pid number no other task can hold"),
-                "the finding must say WHY this sender was believed: {authorization}"
+                "the finding must say WHY this sender was believed"
             );
         }
 
@@ -6039,25 +6100,25 @@ mod tests {
         let zero = identity_note(&p);
         assert!(
             zero.contains("names no task"),
-            "pid 0 must be disclosed as the absence of a sender: {zero}"
+            "pid 0 must be disclosed as the absence of a sender"
         );
         assert!(
             !zero.contains("init"),
-            "pid 0 is not init, and saying it is borrows init's authority for a nobody: {zero}"
+            "pid 0 is not init, and saying it is borrows init's authority for a nobody"
         );
 
         p.pid = 1;
         let one = identity_note(&p);
         assert!(
             one.contains("actor pid 1 is init, a pid number no other task can hold"),
-            "pid 1 must still be named, or the demotion it earns has no stated basis: {one}"
+            "pid 1 must still be named, or the demotion it earns has no stated basis"
         );
 
         p.pid = 4242;
         let other = identity_note(&p);
         assert!(
             other.contains("not the victim's real parent"),
-            "an ordinary pid must say what the kernel did settle: {other}"
+            "an ordinary pid must say what the kernel did settle"
         );
 
         // The unreadable-exe tail is the same in all three, so the fix did not quietly
@@ -6065,7 +6126,7 @@ mod tests {
         for note in [&zero, &one, &other] {
             assert!(
                 note.contains("identity NOT verified"),
-                "an actor whose exe was not read is never described as verified: {note}"
+                "an actor whose exe was not read is never described as verified"
             );
         }
     }
@@ -6088,7 +6149,7 @@ mod tests {
         assert_eq!(f.severity, Severity::Low);
         assert_eq!(f.detail["reason"], "own_reload_path");
         assert!(!f.wants_kill);
-        assert!(f.summary.contains("reload:"), "{}", f.summary);
+        assert!(f.summary.contains("reload:"), "summary must name a reload");
 
         // The identical number at anyone else is a claim about a handler table this
         // process cannot read, so it keeps the terminate-by-default reading.
@@ -6149,11 +6210,11 @@ mod tests {
         let authorization = f.detail["authorization"].as_str().unwrap_or_default();
         assert!(
             authorization.contains("no authorization basis found"),
-            "{authorization}"
+            "authorization must say that no basis was found"
         );
         assert!(
             authorization.contains("identity NOT verified"),
-            "an unreadable executable must be labelled unreadable, not believed: {authorization}"
+            "an unreadable executable must be labelled unreadable, not believed"
         );
     }
 
@@ -6238,8 +6299,7 @@ mod tests {
                     .as_str()
                     .unwrap_or_default()
                     .is_empty(),
-                "{} fired without saying who was believed",
-                f.summary
+                "a finding must say who was believed"
             );
         }
     }
@@ -6283,8 +6343,14 @@ mod tests {
         assert_eq!(f.severity, Severity::Info);
         assert_eq!(f.detail["reason"], "verified_external_reader");
         assert_eq!(f.detail["is_attach"], false);
-        assert!(f.summary.contains("routine observation"), "{}", f.summary);
-        assert!(!f.summary.contains("inspection attempt"), "{}", f.summary);
+        assert!(
+            f.summary.contains("routine observation"),
+            "summary must name routine observation"
+        );
+        assert!(
+            !f.summary.contains("inspection attempt"),
+            "summary must not name an inspection attempt"
+        );
         assert!(!f.wants_kill, "a read never kills");
     }
 
@@ -6306,8 +6372,7 @@ mod tests {
             assert_eq!(f.detail["reason"], "unverified_reader", "{label}");
             assert!(
                 f.summary.contains("inspection attempt"),
-                "{label}: {}",
-                f.summary
+                "{label}: summary must name the inspection attempt"
             );
         }
     }
@@ -6384,10 +6449,12 @@ mod tests {
         assert_eq!(f.detail["reason"], "ptrace_attach");
         assert!(
             !f.summary.contains("routine observation"),
-            "an attach was worded as observation: {}",
-            f.summary
+            "an attach must not be worded as observation"
         );
-        assert!(f.summary.contains("inspection attempt"), "{}", f.summary);
+        assert!(
+            f.summary.contains("inspection attempt"),
+            "summary must name an inspection attempt"
+        );
         assert!(f.wants_kill, "the attach arm keeps its kill gate");
 
         // READ from the identical identity is the demoted case, so the two assertions

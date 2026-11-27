@@ -1546,55 +1546,7 @@ fn parse_line(line: &str) -> Option<(&str, &str, &str)> {
 /// Over-redaction is safe; under-redaction would leak a bridge credential into a
 /// monitoring scrape or the operator's terminal.
 fn redact_secrets(text: &str) -> String {
-    const SECRET_KEYS: &[&str] = &[
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "private_key",
-        "client_secret",
-        "root_token",
-        "hmac_secret",
-    ];
-
-    fn redact_line(line: &str) -> String {
-        let newline = if line.ends_with('\n') { "\n" } else { "" };
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let lower = body.to_ascii_lowercase();
-        let mut best: Option<(usize, usize)> = None; // (start, key_len)
-        for key in SECRET_KEYS {
-            let mut search = 0usize;
-            while let Some(rel) = lower[search..].find(key) {
-                let p = search + rel;
-                let preceded_ok = p == 0 || {
-                    let b = lower.as_bytes()[p - 1];
-                    !(b.is_ascii_alphanumeric() || b == b'_')
-                };
-                let followed_by_eq = lower[p + key.len()..].trim_start().starts_with('=');
-                if preceded_ok && followed_by_eq && best.is_none_or(|(bp, _)| p < bp) {
-                    best = Some((p, key.len()));
-                    break;
-                }
-                search = p + key.len();
-            }
-        }
-        match best {
-            Some((p, klen)) => {
-                let eq_rel = body[p + klen..].find('=').unwrap_or(0);
-                let eq = p + klen + eq_rel;
-                let mut out = String::with_capacity(body.len() + 16);
-                out.push_str(&body[..eq + 1]);
-                out.push_str(" [REDACTED]");
-                out.push_str(newline);
-                out
-            }
-            None => line.to_string(),
-        }
-    }
-
-    text.split_inclusive('\n').map(redact_line).collect()
+    crate::safe_log::redact_secrets(text)
 }
 
 /// Machine-readable form of the SAME report, for a monitoring scraper.
