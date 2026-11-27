@@ -9,11 +9,11 @@ could not be resolved with locally available tooling.
 | Item | Value |
 |---|---|
 | Project license | **GPL-2.0-only** |
-| `Cargo.toml` | `license = "GPL-2.0"` |
+| `Cargo.toml` | `license = "GPL-2.0-only"` |
 | `LICENSE` | Complete, verbatim GNU General Public License v2, June 1991 (338 lines), including the "How to Apply These Terms" section |
-| `bpf/warden.bpf.c` | `SPDX-License-Identifier: GPL-2.0` |
-| `bpf/warden.h` | `SPDX-License-Identifier: GPL-2.0` |
-| Public SBOM | `licenseDeclared: GPL-2.0` / `licenseConcluded: GPL-2.0-only` for the root `warden` package and the eBPF object |
+| `bpf/warden.bpf.c` | `SPDX-License-Identifier: GPL-2.0` (kernel-project spelling of GPLv2-only) |
+| `bpf/warden.h` | `SPDX-License-Identifier: GPL-2.0` (kernel-project spelling of GPLv2-only) |
+| Public SBOM | `licenseDeclared: GPL-2.0-only` / `licenseConcluded: GPL-2.0-only` for the root `warden` package and the eBPF object |
 
 The license text was **not** edited or replaced with a summary. No `COPYING`,
 `NOTICE`, or third-party attribution file exists in the canonical tree; the
@@ -73,8 +73,9 @@ No license string is invented and no package is relabelled to make a gate pass.
    that `LICENSE` is the unmodified v2 text.
 2. Decide whether to add a `NOTICE` file; do not add one speculatively.
 3. Let public CI run `cargo deny check licenses bans` and triage any finding.
-4. Confirm the repository host's license picker matches `Cargo.toml` (external,
-   not performed by PRQ).
+4. The repository host's license picker now reports `GPL-2.0` (GitHub's
+   versionless GPLv2-only identifier), which matches `Cargo.toml`
+   `GPL-2.0-only`; no Apache-2.0 project declaration is present.
 
 ## 7. Status
 

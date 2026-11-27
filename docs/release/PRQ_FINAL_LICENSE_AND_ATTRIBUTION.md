@@ -12,9 +12,9 @@ resolution. No formal legal opinion is offered. Prepared 2026-11-24.
 | Proposed release designation | `v0.1.0-alpha.1` (pre-release metadata only; no tag created) |
 | Project license | **GPL-2.0-only** |
 | `LICENSE` | verbatim GNU GPL v2 text; SHA-256 `edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6` |
-| `Cargo.toml` | `license = "GPL-2.0"` |
-| eBPF sources | `SPDX-License-Identifier: GPL-2.0` in `bpf/warden.bpf.c` and `bpf/warden.h` |
-| SBOM | `docs/release/warden_alpha1.spdx.json`; SPDX 2.3; 79 packages; 78 relationships; SHA-256 `09dd1a06bc11ac6ac7acd995c87b9e1f251c52953f15dc9e9f3820122bdaf218` |
+| `Cargo.toml` | `license = "GPL-2.0-only"` |
+| eBPF sources | `SPDX-License-Identifier: GPL-2.0` in `bpf/warden.bpf.c` and `bpf/warden.h` (kernel-project spelling; normalization is an owner decision) |
+| SBOM | `docs/release/warden_alpha1.spdx.json`; SPDX 2.3; 79 packages; 78 relationships; SHA-256 `8ce721ef5682bee00616de315227634b790b1389417b088170b1e76ede18b1f6` |
 | `Cargo.lock` | 72 packages, 71 with registry checksums, 1 local package; SHA-256 `509d60d0d324a152ea174ed68da2bf79dca2dd8716266bc46d8d692946f51a8f` |
 
 The `v0.1.0-alpha.1` designation fits the current crate version `0.1.0` and
@@ -48,8 +48,9 @@ only the final candidate facts and does not contradict it.
 
 ## 4. External actions before publication
 
-1. Confirm in the public repository settings that the stated license is
-   GPL-2.0-only and that the `LICENSE` file is unchanged.
+1. The public repository settings report `GPL-2.0` (GitHub's versionless
+   GPLv2-only identifier), consistent with `Cargo.toml` `GPL-2.0-only`; the
+   `LICENSE` file is unchanged.
 2. Have a maintainer document the provenance/license of the generated
    `vmlinux.h` rather than guessing.
 3. Run the CI `cargo deny check licenses bans` job in hosted CI and review any
