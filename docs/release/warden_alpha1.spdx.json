@@ -20,7 +20,7 @@
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "GPL-2.0-only",
-      "licenseDeclared": "GPL-2.0",
+      "licenseDeclared": "GPL-2.0-only",
       "copyrightText": "NOASSERTION",
       "supplier": "Organization: WARDEN contributors",
       "checksums": [

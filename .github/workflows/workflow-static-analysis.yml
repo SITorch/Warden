@@ -1,0 +1,85 @@
+name: Workflow and shell static analysis
+
+# Unprivileged static analysis only. This workflow never runs repository code
+# from a pull request, never uses pull_request_target, and needs no secrets.
+# Actionlint and ShellCheck are pinned by SHA-256 and verified before use.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Actionlint and ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout workflow and shell sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install checksum-verified linters
+        id: tools
+        env:
+          ACTIONLINT_SHA: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHELLCHECK_SHA: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/static-analysis-tools"
+          mkdir -p "$work"
+          curl -fsSL -o "$work/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' "$ACTIONLINT_SHA" "$work/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$work/actionlint.tar.gz" -C "$work" actionlint
+          chmod +x "$work/actionlint"
+
+          curl -fsSL -o "$work/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          printf '%s  %s\n' "$SHELLCHECK_SHA" "$work/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf "$work/shellcheck.tar.xz" -C "$work" shellcheck-v0.11.0/shellcheck
+          chmod +x "$work/shellcheck-v0.11.0/shellcheck"
+
+          echo "actionlint=$work/actionlint" >> "$GITHUB_OUTPUT"
+          echo "shellcheck=$work/shellcheck-v0.11.0/shellcheck" >> "$GITHUB_OUTPUT"
+          echo "verified actionlint 1.7.12 and ShellCheck 0.11.0 by pinned SHA-256"
+
+      - name: Actionlint every workflow
+        env:
+          ACTIONLINT: ${{ steps.tools.outputs.actionlint }}
+          SHELLCHECK: ${{ steps.tools.outputs.shellcheck }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          workflows=(.github/workflows/*.yml)
+          if [ "${#workflows[@]}" -eq 0 ]; then
+            echo "actionlint: ERROR: no workflow YAML files found" >&2
+            exit 1
+          fi
+          "$ACTIONLINT" -shellcheck "$SHELLCHECK" "${workflows[@]}"
+          echo "actionlint: PASS (${#workflows[@]} workflow files, 0 diagnostics)"
+
+      - name: ShellCheck every shell script
+        env:
+          SHELLCHECK: ${{ steps.tools.outputs.shellcheck }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' scripts < <(find scripts .github/scripts -type f -name '*.sh' -print0)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "shellcheck: ERROR: no shell scripts found under scripts/ or .github/scripts/" >&2
+            exit 1
+          fi
+          "$SHELLCHECK" --shell=bash "${scripts[@]}"
+          echo "shellcheck: PASS (${#scripts[@]} scripts, 0 findings)"
