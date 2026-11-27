@@ -293,12 +293,14 @@ impl Responder {
         let (result, mechanism) = kill_via(pidfd, pid);
         match result {
             Ok(()) => {
-                log::warn!(
-                    "ENFORCED: SIGKILL → pid {} ({}) via {mechanism} [{}]",
+                let audit = crate::safe_log::FindingLog::new(
+                    None,
+                    f.severity_str(),
+                    f.event_type_str(),
+                    Action::Killed.as_str(),
                     pid,
-                    f.process.comm,
-                    f.summary
                 );
+                log::warn!("ENFORCED: SIGKILL via {mechanism} {audit}");
                 Action::Killed
             }
             Err(err) => {

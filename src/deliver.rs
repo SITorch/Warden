@@ -1021,7 +1021,7 @@ impl Deliverer {
     /// it means a future call site cannot quietly deliver a finding with no outcome
     /// attached — which is exactly the state that left Sentinel unable to tell a
     /// kill from a refusal (W2K-27).
-    pub fn enqueue(&self, f: &Finding, action: Action) {
+    pub fn enqueue(&self, f: &Finding, action: Action) -> String {
         self.counters.produced.fetch_add(1, Ordering::Relaxed);
 
         let event_id = next_event_id(&self.host);
@@ -1044,10 +1044,15 @@ impl Deliverer {
                      this is a Warden bug, not an outage",
                     f.event_type.as_str()
                 );
-                return;
+                // The id is still the stable correlate for the journal line
+                // even though no envelope exists. Return it rather than an
+                // empty placeholder so local audit never loses the handle.
+                return event_id;
             }
         };
 
+        // The record owns its id; the journal line gets the same stable copy.
+        let event_id_for_log = event_id.clone();
         match self.tx.try_send(Record { event_id, body }) {
             Ok(()) => {
                 self.counters.queued.fetch_add(1, Ordering::Relaxed);
@@ -1069,6 +1074,7 @@ impl Deliverer {
                 self.spool_one(rec);
             }
         }
+        event_id_for_log
     }
 
     fn spool_one(&self, rec: Record) {
