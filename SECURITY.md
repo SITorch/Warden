@@ -4,26 +4,23 @@ WARDEN is experimental Alpha software that runs with elevated privileges and
 interacts with kernel security hooks. Security reports are taken seriously and
 handled with coordinated disclosure.
 
-> **Release gate status (WARDEN-OSR-FINAL-03):** this policy designates GitHub
-> Private Vulnerability Reporting (PVR) as the intended private channel. On the
-> currently private `SITorch/Warden` repository the channel is
-> `NOT_CONFIGURED` and `NOT_TESTED`. Publication remains `BLOCKED` until a
-> repository administrator enables PVR on the actual repository, confirms that
-> a monitored account receives notifications, and completes one harmless
-> end-to-end test report. Creating or editing this file does not enable PVR.
-> No email address, PGP key, security team, bug bounty, response SLA, or
-> third-party reporting account has been invented.
+> **Post-public verification status:** this policy uses GitHub Private
+> Vulnerability Reporting (PVR) as the private reporting channel for the public
+> `SITorch/Warden` repository. PVR is enabled on the repository; the user-facing
+> **Security → Report a vulnerability** action is available. No fabricated
+> security-reporting email address, PGP key, security team, bug bounty, response
+> SLA, or third-party reporting account has been invented. End-to-end
+> notification delivery has not been tested against the real repository, so it
+> remains an owner verification item.
 
 ## Private channel verification record
 
-Before public visibility, the repository administrator must record all three
-checks here:
-
 | Check | Status | Evidence |
 |---|---|---|
-| PVR enabled on `SITorch/Warden` | `NOT_CONFIGURED` | Repository Security settings |
-| Notifications monitored by an existing maintainer account | `NOT_TESTED` | Maintainer confirmation |
-| Harmless end-to-end private report completed | `NOT_TESTED` | Maintainer confirmation |
+| PVR enabled on `SITorch/Warden` | `PASS` | Repository Security settings / REST API `GET /repos/SITorch/Warden/private-vulnerability-reporting` |
+| User-facing report channel available | `PASS` | Public repository Security policy page shows **Report a vulnerability** |
+| Notifications monitored by an existing maintainer account | `OWNER_ACTION_REQUIRED` | Maintainer confirmation that GitHub notifications are monitored |
+| Harmless end-to-end private report completed | `NOT_TESTED` | No fabricated report was submitted to the production repository |
 
 ## Supported versions
 
@@ -107,14 +104,13 @@ actively exploited issues.
 When a fix is ready, the intended path is a GitHub Security Advisory and a
 public release note describing the affected versions and mitigation. No
 advisory, fix, or user notification has been issued by this candidate. The
-actual maintainer must confirm that advisory notifications reach a monitored
-account before publication.
+maintainer must confirm that advisory notifications reach a monitored account;
+this is an owner verification item, not a claim of end-to-end delivery.
 
 ## Bug bounty program
 
 No bug bounty program exists for this candidate and none is claimed. Reports are
-accepted through the private reporting channel described above once it is
-actually enabled and monitored.
+accepted through the enabled private reporting channel described above.
 
 ## Scope
 
