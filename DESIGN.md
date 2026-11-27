@@ -286,7 +286,7 @@ ring at all. Six `fexit` programs keep totals in a map:
 | `fexit/tcp_sendmsg`      | `tcp_sendmsg(struct sock *, msghdr *, size_t) → int` | egress: bytes the kernel accepted into the send queue (`ret`), and the call |
 | `fexit/udp_sendmsg`      | `udp_sendmsg(struct sock *, msghdr *, size_t len) → int` | egress: the same pair for datagrams |
 | `fexit/tcp_cleanup_rbuf` | `tcp_cleanup_rbuf(struct sock *, int copied) → void`   | ingress: bytes copied to userspace, and the completion |
-| `fexit/udp_recvmsg`      | `udp_recvmsg(struct sock *, msghdr *, size_t, int flags, int *addr_len) → int` — the five-argument `struct proto::recvmsg` shape, **not** the four-argument `struct proto_ops::recvmsg` | ingress: the same pair for IPv4 datagrams (stage ۱۶f; **REALISTICALLY_TESTED** — loaded, attached and counted on the deployment kernel, §23 of `scripts/LIVE_VALIDATION.md`) |
+| `fexit/udp_recvmsg`      | `udp_recvmsg(struct sock *, msghdr *, size_t, int flags, int *addr_len) → int` — the five-argument `struct proto::recvmsg` shape, **not** the four-argument `struct proto_ops::recvmsg` | ingress: the same pair for IPv4 datagrams (stage ۱۶f; **REALISTICALLY_TESTED** — loaded, attached and counted on the deployment kernel, §23 of `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md`) |
 | `fexit/udpv6_sendmsg`    | `udpv6_sendmsg(struct sock *, msghdr *, size_t) → int`, the `struct proto::sendmsg` shape | IPv6 datagram egress — **LIVE_VALIDATED_M15** (socket-path accounting; see below) |
 | `fexit/udpv6_recvmsg`    | `udpv6_recvmsg(struct sock *, msghdr *, size_t, int flags, int *addr_len) → int`, the same `struct proto::recvmsg` shape | IPv6 datagram ingress — **LIVE_VALIDATED_M15** (socket-path accounting; see below) |
 
@@ -346,7 +346,7 @@ Design decisions that are not visible in the code and should not be re-derived:
   `wire > these totals` for a plain flow and `these totals > plaintext` for a TLS
   flow — both correct, neither a bug, and the reason a volume line must never be
   reconciled against an interface counter. An earlier draft of the caveat claimed
-  TLS overhead was excluded; the live run in `scripts/LIVE_VALIDATION.md` §۲۲ is
+  TLS overhead was excluded; the live run in `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §۲۲ is
   what falsified it. Kernel TLS (kTLS) is not characterised: this host does not
   enable it and nothing here measured which path its records take.
 - **The read side is a bounded, self-caveating tick.** A `--net-volume` one-shot
@@ -401,7 +401,7 @@ were conflated in earlier drafts, and the difference is the whole point of W-R1.
   `[network_rules].deny_destinations` list remains an observe-only decision;
   neither gained kill intent or a traffic claim. See
   `docs/security/warden_phase7_egress_enforcement.md` for the contract and
-  `scripts/LIVE_VALIDATION.md` and `docs/security/warden_coverage_matrix.md` for the privileged-evidence boundary.
+  `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` and `docs/security/warden_coverage_matrix.md` for the privileged-evidence boundary.
 - **Process kill — IMPLEMENTED (userspace); the in-kernel path is PLANNED.**
   A confirmed T1/T3 (reverse shell, fileless exec) can be killed via userspace
   signalling in `src/respond.rs`, gated on `mode = "enforce"` and an opt-in
@@ -1078,9 +1078,9 @@ buildable milestone's substance is present. The single ABI carries all sensors;
   *loads* at all: `bpftool prog loadall … autoattach` returned 0 for the
   stage-13 object on `6.12.107+deb13-amd64`, and a *throwaway* kprobe/kretprobe
   pair on `__inet_stream_connect` attached and fired there — Warden's own pair has
-  not (`scripts/LIVE_VALIDATION.md` §16).
+  not (`docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §16).
 - [ ] **Confirm the network transport byte on a live host**
-  (`scripts/LIVE_VALIDATION.md` §15). The packed `aux2` is tested against synthetic
+  (`docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §15). The packed `aux2` is tested against synthetic
   records only: unit tests prove the decoder, not that the kernel wrote them. What a
   run has to show is (a) a `connect` to a UDP socket arrives with `udp` and not
   `null`, (b) a record from the previous object still decodes with no claim — the
@@ -1090,7 +1090,7 @@ buildable milestone's substance is present. The single ABI carries all sensors;
   should not be able to take the agent down; making that true is a separate,
   owner-approved change).
 - [ ] **Confirm the connect verdict on a live host**
-  (`scripts/LIVE_VALIDATION.md` §16). The pair was measured with a throwaway probe on
+  (`docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §16). The pair was measured with a throwaway probe on
   the deployment kernel — attach, fire, terminal codes, the 91% in-flight share — but
   the shipped programs have not been run against a real dial through Warden's own ring
   buffer. What a run has to show: (a) a blocking connect that succeeds yields a
@@ -1100,7 +1100,7 @@ buildable milestone's substance is present. The single ABI carries all sensors;
   (d) `__inet_stream_connect` resolves on the running kernel — the same fail-closed
   exposure as N-14, now on an internal symbol rather than a `security_*` hook.
 - [ ] **Run the pull path on the deployment host** (`warden --socket-snapshot`,
-  then `scripts/LIVE_VALIDATION.md` §17). What it has to show is not a detection:
+  then `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §17). What it has to show is not a detection:
   (a) the four tables parse with **0 rows rejected** on that kernel's spelling,
   (b) the *pre-existing* listeners are named once on the baseline tick, which is
   the whole reason the path exists — every one of them is invisible to the push

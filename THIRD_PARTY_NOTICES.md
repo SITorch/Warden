@@ -8,7 +8,9 @@ candidate. It is not a legal opinion.
 WARDEN is licensed under **GPL-2.0-only**. The root `LICENSE` contains the
 verbatim GNU General Public License version 2 text. The eBPF sources carry
 `SPDX-License-Identifier: GPL-2.0`; the userspace package declares
-`license = "GPL-2.0"` in `Cargo.toml`.
+`license = "GPL-2.0-only"` in `Cargo.toml`. The two eBPF SPDX headers retain
+the kernel-project `GPL-2.0` spelling; changing them is an owner decision and
+this document does not infer `or-later` terms from that spelling.
 
 ## Rust dependencies
 
@@ -23,7 +25,7 @@ relationships). The observed license distribution in that SBOM is:
 - 3 MIT-only packages.
 - 1 package under `(MIT OR Apache-2.0) AND Unicode-3.0`.
 - 1 Zlib-licensed package.
-- 2 WARDEN entries under GPL-2.0 / GPL-2.0-only.
+- 2 WARDEN entries under GPL-2.0-only.
 - 6 native runtime library entries with `NOASSERTION`.
 
 `cargo metadata --locked` reports 72 Rust packages; the SBOM has 79 entries

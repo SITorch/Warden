@@ -33,7 +33,7 @@
 //! It runs unprivileged: it reads the ELF and source text, it does not load
 //! programs or touch a kernel map. The empirical half — that an armed rule
 //! actually returns -EPERM on a real kernel — needs the isolated privileged VM
-//! and lives in `docs/security/warden_phase6_live_validation.md`; it is never
+//! and lives in `docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md`; it is never
 //! faked here with a test that would pass without loading a BPF instruction.
 
 use aya::include_bytes_aligned;

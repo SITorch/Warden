@@ -22,6 +22,7 @@ export time because the canonical mirrors must remain byte-identical.
 | 12 | `SECURITY.md` | Private Forgejo/LAN reporting policy | Rewritten as public private-vulnerability-reporting policy |
 | 13 | `config/warden.toml` permission | Sample mode `0664` vs "root-only" text | Mode fixed to `0640`; self-test now reports `configuration_permissions PASS` |
 | 14 | `README.md` | Broken refs `EVALUATION-AND-FIXES.md`, `warden_phase6_live_validation.md` | Replaced with existing `docs/security/warden_coverage_matrix.md` and `scripts/LIVE_VALIDATION.md` §§15/17 |
+| 15 | Public docs and one code comment | Excluded raw runbook pointers remained in the shipped tree | Added `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` and reconciled current pointers; historical rows 6 and 14 are unchanged |
 
 ## 2. Export-time corrections (canonical mirrors intentionally unchanged)
 

@@ -552,7 +552,7 @@ impl Loaded {
         // This is the first Warden attach target that is NOT an LSM/security_* hook:
         // `security_*` names are the stable API surface, while an internal function
         // name is a weaker contract. It was therefore measured before being shipped
-        // (see LIVE_VALIDATION.md §16 and EVALUATION-AND-FIXES.md §42): the symbol is
+        // (see docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md §§16/42): the symbol is
         // present and non-blacklisted on the deployment kernel, the pair attaches and
         // fires there, and both signatures agree on the two kernels surveyed. The cost
         // of getting this wrong is N-14's: a target that cannot be resolved fails the
@@ -581,8 +581,8 @@ impl Loaded {
         // the child socket, so 2021/2021 entry and 2184/2184 return probes on the
         // deployment kernel saw `newsock->sk == NULL` and had no peer to report.
         // `inet_accept`'s return is where the child holds its 4-tuple while `current`
-        // is still the accepting task. Measured before shipping (LIVE_VALIDATION.md and
-        // EVALUATION-AND-FIXES.md §45/§46): symbol present and kprobe-attachable,
+        // is still the accepting task. Measured before shipping (docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md and
+        // docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md §45/§46): symbol present and kprobe-attachable,
         // signature vlen=3 on both surveyed kernels, 6301 calls fired cleanly, zero
         // stash misses, peak 3 entries outstanding.
         //

@@ -24,7 +24,7 @@
 //!
 //! The second thing pinned here was MEASURED, not designed, on the deployment
 //! kernel (`6.12.107+deb13-amd64`) with a throwaway kprobe/kretprobe pair — tables
-//! in `EVALUATION-AND-FIXES.md` §46 and `scripts/LIVE_VALIDATION.md` §18. Three
+//! in `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §46 and `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` §18. Three
 //! measurements changed the code's shape:
 //!   - the obvious hook does not work. `security_socket_accept` runs before the
 //!     protocol family installs the child, and `newsock->sk` was NULL in 2021 of

@@ -7,7 +7,7 @@
 //! between-ticks delta the journal prints, and the coverage sentence that says
 //! what the totals cannot see.
 //!
-//! WHY THIS EXISTS AT ALL. EVALUATION-AND-FIXES.md §۳۹ measured the problem: the
+//! WHY THIS EXISTS AT ALL. docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md §۳۹ measured the problem: the
 //! events ring is lossy and defaults to 256 KiB — about 760 records in flight at
 //! 344 bytes each — while a record about a connection carries roughly twelve
 //! bytes of network fact. An operator asking "how much did this container move"
@@ -129,7 +129,7 @@ impl VolumeHook {
 
 /// The two IPv6 datagram functions this build now attaches.
 ///
-/// §23 of `scripts/LIVE_VALIDATION.md` measured that an IPv6 datagram is sent and
+/// §23 of `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` measured that an IPv6 datagram is sent and
 /// read through these, not through `udp_sendmsg`/`udp_recvmsg`, and §24 confirmed
 /// they are in the kernel's ftrace attach list. They stay as a named constant so
 /// the doctor, the coverage line and the tests can be checked against the same

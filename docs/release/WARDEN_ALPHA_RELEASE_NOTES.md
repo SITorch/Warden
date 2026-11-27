@@ -20,7 +20,7 @@ rewritten installer.
 - Rust daemon, eBPF C/source, shipped BPF object and tests.
 - Systemd units, safe public example config and preview-first install wizard.
 - Unprivileged CI workflow pinned to verified Action SHAs, contributor
-  documents, support boundaries, third-party notices, GPL-2.0 license and SBOM.
+  documents, support boundaries, third-party notices, GPL-2.0-only license and SBOM.
 - Sanitized decision, security, kernel, enforcement, installer and supply-chain
   reports with explicit limitations. Raw private evidence is excluded.
 

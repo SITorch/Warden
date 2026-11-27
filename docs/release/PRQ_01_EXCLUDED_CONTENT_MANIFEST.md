@@ -75,6 +75,10 @@ documented.
 | Final post-rebuild rescan | `PASS` (see final evidence index) |
 
 
+## Public Alpha documentation reconciliation
+
+The excluded raw log is still `scripts/LIVE_VALIDATION.md`; current public references use `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` and sanitized PRQ reports.
+
 ## OSR-FINAL-03 reconciliation — 2026-11-25
 
 This section was added after FINAL-02. It does not alter the historical record

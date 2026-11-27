@@ -4,15 +4,26 @@ WARDEN is experimental Alpha software that runs with elevated privileges and
 interacts with kernel security hooks. Security reports are taken seriously and
 handled with coordinated disclosure.
 
-> **Release gate note (WARDEN-OSR-FINAL-03):** this policy designates GitHub
-> Private Vulnerability Reporting as the intended private channel. The candidate
-> repository does not yet exist, so the channel is `NOT_CONFIGURED` and
-> `NOT_TESTED`. Publication remains `BLOCKED` until a repository administrator
-> enables the feature on the actual public repository, confirms that a monitored
-> account receives notifications, and completes one harmless end-to-end test
-> report. Creating this file does not enable private reporting. No email address,
-> PGP key, security team, bug bounty, response SLA, or third-party reporting
-> account has been invented.
+> **Release gate status (WARDEN-OSR-FINAL-03):** this policy designates GitHub
+> Private Vulnerability Reporting (PVR) as the intended private channel. On the
+> currently private `SITorch/Warden` repository the channel is
+> `NOT_CONFIGURED` and `NOT_TESTED`. Publication remains `BLOCKED` until a
+> repository administrator enables PVR on the actual repository, confirms that
+> a monitored account receives notifications, and completes one harmless
+> end-to-end test report. Creating or editing this file does not enable PVR.
+> No email address, PGP key, security team, bug bounty, response SLA, or
+> third-party reporting account has been invented.
+
+## Private channel verification record
+
+Before public visibility, the repository administrator must record all three
+checks here:
+
+| Check | Status | Evidence |
+|---|---|---|
+| PVR enabled on `SITorch/Warden` | `NOT_CONFIGURED` | Repository Security settings |
+| Notifications monitored by an existing maintainer account | `NOT_TESTED` | Maintainer confirmation |
+| Harmless end-to-end private report completed | `NOT_TESTED` | Maintainer confirmation |
 
 ## Supported versions
 

@@ -48,6 +48,12 @@ addition/removal rationale is recorded in `PRQ_01_EXCLUDED_CONTENT_MANIFEST.md`.
 - No `.pem`, `.key`, `.crt`, `.env*`, `warden.zip`, `warden2.zip`, raw
   `LIVE_VALIDATION.md`, xattrs or symlinks are present.
 
+## Public Alpha documentation reconciliation
+
+Excluded raw logs remain absent from the shipped tree. Public operational
+pointers now use `docs/release/WARDEN_PUBLIC_LIVE_RUNBOOK.md` instead of the
+excluded raw runbook.
+
 ## 2. Export-only transformations
 
 The canonical tree is not rewritten. These changes are applied by the export

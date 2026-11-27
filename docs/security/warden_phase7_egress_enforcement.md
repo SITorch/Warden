@@ -1,7 +1,7 @@
 # Warden Phase 7 — Genuine Kernel Egress Enforcement
 
 **Status:** implemented in the tree; **disabled by default**; live verification is
-recorded in `warden_phase6_live_validation.md` and classified per test. This
+recorded in `docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md` and classified per test. This
 document is the contract for the *code*, not a claim that any production host is
 protected.
 
@@ -82,7 +82,7 @@ the convention is the reverse of the file-LSM programs: **1 allows, 0 denies**.
 Returning `-EPERM` from the BPF program was measured to fail `BPF_PROG_LOAD` on
 `6.12.107+deb13-amd64`; the syscall-visible `EPERM` is produced by returning 0.
 The live proof and the correction history are in
-`warden_phase6_live_validation.md` §5 and
+`docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md` §5 and
 `warden_kernel_compatibility_matrix.md` §3.
 
 `Config::validate` rejects `arm = true` while `enabled = false`, so a dormant
@@ -218,7 +218,7 @@ Phase 7 code path.
 
 ## 7. Verification status
 
-Historical privileged evidence lives in `docs/security/warden_phase6_live_validation.md`
+Historical privileged evidence lives in `docs/release/PRQ_06_ENFORCEMENT_QUALIFICATION.md`
 outside the standalone `Warden/` tree. An earlier isolated-VM run recorded
 13/13 `EXECUTED AND PASSED`, including shadow allow, shadow counter, armed IPv4
 TCP `EPERM`, armed UDP `sendmsg4` `EPERM`, armed IPv6 TCP `EPERM`, and
