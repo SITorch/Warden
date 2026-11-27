@@ -1,9 +1,11 @@
 name: CodeQL
 
 # Advanced CodeQL setup for the shipped language set. It is explicitly not a
-# required check on this private repository: advanced setup needs public
-# visibility or GitHub Code Security. The entitlement gate records
-# DEFERRED_PRIVATE_REPOSITORY instead of treating a skip as a PASS.
+# required check while this workflow has not yet executed on the public
+# repository. Advanced setup needs public visibility or GitHub Code Security.
+# The entitlement gate records DEFERRED_PRIVATE_REPOSITORY or
+# DEFERRED_INTERNAL_REPOSITORY instead of treating a skip as a PASS. Metadata
+# retrieval failures fail the job rather than being misread as a deferral.
 # No pull_request_target, secrets, or privileged build/run step is used.
 
 on:
@@ -36,16 +38,39 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          visibility="$(gh api "repos/${REPOSITORY}" --jq '.visibility')"
-          echo "repository visibility: ${visibility}"
-          if [ "$visibility" != "PUBLIC" ]; then
-            echo "supported=false" >> "$GITHUB_OUTPUT"
-            echo "CODEQL_STATUS=DEFERRED_PRIVATE_REPOSITORY"
-            echo "::notice::CodeQL=DEFERRED_PRIVATE_REPOSITORY; advanced setup requires public visibility or GitHub Code Security. This is not a PASS."
-          else
-            echo "supported=true" >> "$GITHUB_OUTPUT"
-            echo "CODEQL_STATUS=ELIGIBLE; analysis will run in the matrix job."
+          if ! visibility_raw="$(gh api "repos/${REPOSITORY}" --jq '.visibility')"; then
+            echo "CODEQL_STATUS=METADATA_FETCH_FAILED" >&2
+            echo "::error::Unable to retrieve repository visibility; refusing to defer as private."
+            exit 1
           fi
+          if [ -z "$visibility_raw" ]; then
+            echo "CODEQL_STATUS=METADATA_MISSING" >&2
+            echo "::error::Repository visibility is empty; refusing to defer as private."
+            exit 1
+          fi
+          visibility="$(printf '%s' "$visibility_raw" | tr '[:upper:]' '[:lower:]')"
+          echo "repository visibility: ${visibility} (raw: ${visibility_raw})"
+          case "$visibility" in
+            public)
+              echo "supported=true" >> "$GITHUB_OUTPUT"
+              echo "CODEQL_STATUS=ELIGIBLE; analysis will run in the matrix job."
+              ;;
+            private)
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+              echo "CODEQL_STATUS=DEFERRED_PRIVATE_REPOSITORY"
+              echo "::notice::CodeQL=DEFERRED_PRIVATE_REPOSITORY; advanced setup requires public visibility or GitHub Code Security. This is not a PASS."
+              ;;
+            internal)
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+              echo "CODEQL_STATUS=DEFERRED_INTERNAL_REPOSITORY"
+              echo "::notice::CodeQL=DEFERRED_INTERNAL_REPOSITORY; advanced-setup entitlement must be verified before analysis. This is not a PASS."
+              ;;
+            *)
+              echo "CODEQL_STATUS=UNKNOWN_VISIBILITY" >&2
+              echo "::error::Unexpected repository visibility '${visibility_raw}'; refusing to defer."
+              exit 1
+              ;;
+          esac
 
   analyze:
     name: Analyze ${{ matrix.language }}
