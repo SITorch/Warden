@@ -216,6 +216,22 @@ allow_loopback = true        # 127.0.0.0/8 and ::1 are local IPC, never C2
 # max_history = 32
 # max_destinations = 32
 
+# ── cross-event attack-chain correlation ────────────────────────────────────
+# Joins two observations the ordinary judges already made suspicious: a shell
+# exec then an unsanctioned dial; a privilege raise then a persistence write,
+# module or BPF load; a suspicious listener then an accepted flow on its port;
+# an unsanctioned dial then the kernel's Established verdict. The join is by
+# pid, endpoint and kernel timestamp, never by comm; when both halves carry a
+# /proc start time they must agree, so a recycled pid cannot inherit a chain.
+# It emits
+# endpoint:attack_chain (Medium/High) and requests NO kill and NO denial.
+# Bounded to 8 anchors per actor and max_actors actors; dropping state can
+# lose a chain but cannot invent one. The values below are the shipped defaults.
+# [correlation]
+# enabled = true
+# window_ms = 10000
+# max_actors = 4096
+
 # ── credential-based detection (privilege escalation) ───────────────────────
 # The kernel watches commit_creds — the one chokepoint every credential change
 # flows through — and only wakes userspace on a genuine RAISE (euid crossing to

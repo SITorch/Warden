@@ -76,6 +76,12 @@ pub struct Config {
     #[serde(default)]
     pub c2_rules: C2Rules,
 
+    /// Bounded cross-event joins (shell→egress, privilege→persistence,
+    /// listener→accept, dial→established). Consumes judged events only; emits
+    /// observe-only findings and never requests enforcement.
+    #[serde(default)]
+    pub correlation: CorrelationRules,
+
     /// credential-based detection (T5 privilege escalation).
     #[serde(default)]
     pub cred_rules: CredRules,
@@ -651,6 +657,43 @@ impl Default for C2Rules {
             max_actors: default_c2_max_actors(),
             max_history: default_c2_max_history(),
             max_destinations: default_c2_max_destinations(),
+        }
+    }
+}
+
+/// Bounds for the cross-event correlator. Both limits are hard memory bounds:
+/// the module must not grow with host uptime or with an event flood. The window
+/// is a correlation limit, not a retention promise — anchors are dropped, never
+/// written to disk.
+///
+/// Enabled by default because every join uses only events the ordinary judges
+/// already flagged: turning it on adds no new sensor, no new privilege and no
+/// enforcement. An operator who does not want chain findings can disable it
+/// without changing any other rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrelationRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_correlation_window_ms")]
+    pub window_ms: u64,
+    #[serde(default = "default_correlation_max_actors")]
+    pub max_actors: usize,
+}
+
+const fn default_correlation_window_ms() -> u64 {
+    10_000
+}
+
+const fn default_correlation_max_actors() -> usize {
+    4096
+}
+
+impl Default for CorrelationRules {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_ms: default_correlation_window_ms(),
+            max_actors: default_correlation_max_actors(),
         }
     }
 }
@@ -2357,6 +2400,29 @@ impl Config {
             }
         }
 
+        // A zero correlation window can never join two events, and an unbounded
+        // actor map is a memory promise Warden cannot keep. Refuse both rather
+        // than ship a rule that reads as enabled but is dead or grows forever.
+        if self.correlation.enabled {
+            if self.correlation.window_ms == 0 || self.correlation.window_ms > 300_000 {
+                anyhow::bail!(
+                    "correlation.window_ms = {} is outside 1..=300000: a zero window can \
+                     never join two observations, and a very large one keeps stale anchors \
+                     that could link unrelated events. Use 10000 (10 s) unless you have a \
+                     measured reason to change it.",
+                    self.correlation.window_ms
+                );
+            }
+            if self.correlation.max_actors == 0 || self.correlation.max_actors > 65_536 {
+                anyhow::bail!(
+                    "correlation.max_actors = {} is outside 1..=65536: the correlator holds a \
+                     bounded anchor queue per actor, so this is a hard memory bound, not an \
+                     estimate. Use 4096 unless the host has a measured need for more.",
+                    self.correlation.max_actors
+                );
+            }
+        }
+
         // A burst rule with a zero window can never fire: every earlier op is
         // evicted at `now - 0`, so the count stays at 1 and a threshold above 1
         // is dead policy that still reads as armed in the config.
@@ -2728,6 +2794,7 @@ impl Config {
             exec_rules: ExecRules::default(),
             network_rules: NetworkRules::default(),
             c2_rules: C2Rules::default(),
+            correlation: CorrelationRules::default(),
             cred_rules: CredRules::default(),
             ptrace_rules: PtraceRules::default(),
             module_rules: ModuleRules::default(),
@@ -4315,5 +4382,40 @@ deny = ["read", "write", "exec"]
         assert!(!line.contains("SENTINEL_TEST_CREDENTIAL"), "{line}");
         assert!(!line.contains("key.pem"), "{line}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn correlation_defaults_are_bounded_and_observe_only() {
+        let d = CorrelationRules::default();
+        assert!(d.enabled);
+        assert_eq!(d.window_ms, 10_000);
+        assert_eq!(d.max_actors, 4096);
+
+        // An operator who writes no [correlation] table gets exactly the same
+        // bounded, enabled posture as the safe default.
+        let cfg: Config = toml::from_str("mode = \"observe\"\n").unwrap();
+        assert_eq!(cfg.correlation.window_ms, d.window_ms);
+        assert_eq!(cfg.correlation.max_actors, d.max_actors);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn unusable_correlation_bounds_are_refused() {
+        for (document, fragment) in [
+            ("[correlation]\nwindow_ms = 0\n", "correlation.window_ms"),
+            (
+                "[correlation]\nwindow_ms = 300001\n",
+                "correlation.window_ms",
+            ),
+            ("[correlation]\nmax_actors = 0\n", "correlation.max_actors"),
+            (
+                "[correlation]\nmax_actors = 65537\n",
+                "correlation.max_actors",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(document).unwrap();
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(fragment), "{err}");
+        }
     }
 }

@@ -18,6 +18,7 @@ mod btf_compat;
 mod c2;
 mod config;
 mod config_engine;
+mod correlate;
 mod deliver;
 mod detect;
 mod doctor;
@@ -1735,33 +1736,46 @@ fn run(cfg: Config, args: Args) -> anyhow::Result<()> {
                     netns
                 );
             }
-            let Some(finding) = detector.judge(&event) else {
-                continue;
-            };
-            stats.findings += 1;
+            // Both the ordinary judge and the cross-event correlator see every
+            // decoded event. The correlator is fed the judge's answer, so a
+            // CONNECT_RESULT or FLOW the judge declined can still complete a
+            // chain, and no rule is ever evaluated twice for the same record.
+            let primary = detector.judge(&event);
+            let chain = detector.correlate(&event, primary.as_ref());
 
-            let action = responder.act(&finding, &protected);
-            // Enqueue first so the local line can carry the same stable event id
-            // as the remote envelope. The journal gets an allowlisted summary;
-            // `Finding.summary`/`detail` remain in the remote record only.
-            let event_id = deliverer.as_ref().map(|d| d.enqueue(&finding, action));
-            if log_throttle.admit(
-                finding.process.pid,
-                finding.event_type_str(),
-                Instant::now(),
-            ) {
-                log::warn!(
-                    "{}",
-                    safe_log::FindingLog::new(
-                        event_id.as_deref(),
-                        finding.severity_str(),
-                        finding.event_type_str(),
-                        action.as_str(),
-                        finding.process.pid,
-                    )
-                );
-            } else {
-                stats.suppressed_logs += 1;
+            let mut emit = |finding: detect::Finding| {
+                stats.findings += 1;
+                let action = responder.act(&finding, &protected);
+                // Enqueue first so the local line can carry the same stable
+                // event id as the remote envelope. The journal gets an
+                // allowlisted summary; `Finding.summary`/`detail` remain in
+                // the remote record only. This is the same safe_log path for
+                // chain findings as for every other finding type.
+                let event_id = deliverer.as_ref().map(|d| d.enqueue(&finding, action));
+                if log_throttle.admit(
+                    finding.process.pid,
+                    finding.event_type_str(),
+                    Instant::now(),
+                ) {
+                    log::warn!(
+                        "{}",
+                        safe_log::FindingLog::new(
+                            event_id.as_deref(),
+                            finding.severity_str(),
+                            finding.event_type_str(),
+                            action.as_str(),
+                            finding.process.pid,
+                        )
+                    );
+                } else {
+                    stats.suppressed_logs += 1;
+                }
+            };
+            if let Some(finding) = primary {
+                emit(finding);
+            }
+            if let Some(finding) = chain {
+                emit(finding);
             }
         }
     }

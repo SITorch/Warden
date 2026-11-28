@@ -55,6 +55,12 @@ pub enum FindingType {
     /// behavioural observation, not a verdict and never a kill request.
     #[serde(rename = "endpoint:c2_beaconing")]
     C2Beaconing,
+    /// A bounded join of two already-judged kernel observations (e.g. a
+    /// suspicious exec followed by an unsanctioned dial). A stronger signal
+    /// than either half alone, but observe-only: never a kill request, never a
+    /// claim about payload, DNS or TLS metadata this build cannot see.
+    #[serde(rename = "endpoint:attack_chain")]
+    AttackChain,
     #[serde(rename = "endpoint:module_load")]
     ModuleLoad,
     #[serde(rename = "endpoint:file_tamper")]
@@ -84,6 +90,7 @@ impl FindingType {
             FindingType::PrivilegeChange => "endpoint:privilege_change",
             FindingType::NetworkConnect => "endpoint:network_connect",
             FindingType::C2Beaconing => "endpoint:c2_beaconing",
+            FindingType::AttackChain => "endpoint:attack_chain",
             FindingType::ModuleLoad => "endpoint:module_load",
             FindingType::FileTamper => "endpoint:file_tamper",
             FindingType::NewService => "endpoint:new_service",
@@ -275,6 +282,10 @@ pub struct Detector {
     /// Phase 4: bounded per-process beaconing state over CONNECT telemetry.
     /// Interior-mutable like `file_bursts`; the event loop is single-threaded.
     c2: RefCell<C2Tracker>,
+    /// Bounded cross-event joins over the judged stream. Anchors are kernel
+    /// timestamps plus the identity of an already-suspicious event — no payload,
+    /// no `comm`-only trust, and never an enforcement decision.
+    correlator: RefCell<crate::correlate::Correlator>,
     /// Phase 1 → Phase 4 quality link. `None` means the live ring-loss ratio
     /// could not be read, which caps C2 confidence rather than inflating it.
     c2_ring_loss: Cell<Option<f64>>,
@@ -533,6 +544,7 @@ pub(crate) fn under_dir(path: &str, dir: &str) -> bool {
 impl Detector {
     pub fn new(cfg: Config) -> Self {
         let c2 = C2Tracker::new(cfg.c2_rules.clone());
+        let correlation = cfg.correlation.clone();
         Self {
             cfg,
             file_bursts: RefCell::new(HashMap::new()),
@@ -543,6 +555,7 @@ impl Detector {
             protected: RefCell::new(Protected::default()),
             fabricated: None,
             c2: RefCell::new(c2),
+            correlator: RefCell::new(crate::correlate::Correlator::new(correlation)),
             c2_ring_loss: Cell::new(None),
             egress_preflight: Cell::new(None),
         }
@@ -879,6 +892,19 @@ impl Detector {
             f.source_ts_ns = e.ts_ns;
             f
         })
+    }
+
+    /// Join this event with earlier judged events. Call for *every* decoded
+    /// event, including ones the judge declined: a CONNECT_RESULT or a FLOW is
+    /// useful precisely when it follows a finding the judge already raised.
+    ///
+    /// The correlator receives the judge's answer rather than re-running it, so
+    /// the beaconing tracker is never advanced twice for one dial. Every chain
+    /// is observe-only and is emitted as its own stable finding type.
+    pub fn correlate(&self, e: &Event, primary: Option<&Finding>) -> Option<Finding> {
+        let matched = self.correlator.borrow_mut().observe(e, primary)?;
+        let proc = self.enrich(e);
+        Some(self.correlator.borrow().finding_for(matched, proc, e))
     }
 
     /// Which identity, if any, names a shell or scripting host.

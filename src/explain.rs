@@ -1445,6 +1445,7 @@ fn kill_reason(f: &Finding) -> String {
         F::AccessDenied => "report-only: the kernel already denied it in-kernel",
         F::SelfDegraded => "report-only: an operational finding about Warden's own uplink",
         F::C2Beaconing => "report-only: a confidence-bearing behavioural signal, never a kill",
+        F::AttackChain => "report-only: a cross-event join, never a kill request",
     };
     format!("the class's own gate is {toggle}")
 }

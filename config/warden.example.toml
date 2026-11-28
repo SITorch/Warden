@@ -108,6 +108,17 @@ max_actors = 512
 max_history = 32
 max_destinations = 32
 
+# Cross-event joins of already-judged observations. This adds no sensor and no
+# enforcement: it only emits endpoint:attack_chain when two suspicious events
+# from the same pid line up within the window, using the kernel's own monotonic
+# timestamps, plus /proc start-time identity when both halves carry one.
+# Event kinds used are exec, connect, creds, listen, connect_result and flow;
+# no payload, DNS or TLS metadata is inferred.
+[correlation]
+enabled = true
+window_ms = 10000
+max_actors = 4096
+
 [cred_rules]
 app_privesc_only = true
 expected_privilege_comms = [
